@@ -26,8 +26,8 @@ os.environ['XLA_FLAGS'] = xla_flags
 np.set_printoptions(precision=3, suppress=True, linewidth=100)
 
 brax_renderer = False
-model_path = '/home/matasever/projects/Quadrupeds_STLReward/models/2026_02_02'
-ckpt_path = '/home/matasever/projects/Quadrupeds_STLReward/models/ckpts/2026_02_02/178257920'
+model_path = '/home/matasever/projects/Quadrupeds_STLReward/models/2026_03_04'
+ckpt_path = '/home/matasever/projects/Quadrupeds_STLReward/models/ckpts/2026_03_04/133693440'
 
 env = BarkourEnv() 
 make_inference_fn, params, _= ppo.train(environment=env, 
@@ -50,7 +50,7 @@ jit_reset = jax.jit(eval_env.reset)
 jit_step = jax.jit(eval_env.step)
 
 # @markdown Commands **only used for Barkour Env**:
-x_vel = 1.5 #1.0  #@param {type: "number"}
+x_vel = 1.0 #1.0  #@param {type: "number"}
 y_vel = 0.0  #@param {type: "number"}
 ang_vel = 0.0  #@param {type: "number"}
 
@@ -60,6 +60,17 @@ the_command = jp.array([x_vel, y_vel, ang_vel])
 rng = jax.random.PRNGKey(0)
 state = jit_reset(rng)
 state.info['command'] = the_command
+
+# Optional: initialize mode so first reward step uses the correct spec
+vx_abs = jp.abs(the_command[0])
+if float(vx_abs) >= 1.8:
+  state.info['mode'] = jp.array(2, dtype=jp.int32)  # bound
+elif float(vx_abs) >= 0.75:
+  state.info['mode'] = jp.array(1, dtype=jp.int32)  # trot
+else:
+  state.info['mode'] = jp.array(0, dtype=jp.int32)  # walk
+state.info['history_len'] = jp.array(0, dtype=jp.int32)
+
 rollout = [state.pipeline_state]
 
 # grab a trajectory

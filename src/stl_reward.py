@@ -1,227 +1,104 @@
-import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
-import mujoco
-from coeff_config import tau_max, Fz_min, eps_v, eps_yaw, mu, beta
-from coeff_config import alpha_b, w_vx, alpha_vx, w_vy, alpha_vy, w_yaw, alpha_yaw, alpha_torque
-from coeff_config import w_nlegs, alpha_nlegs, w_torque, gamma_tau, w_tau, alpha_tau
+from coeff_config import (
+    tau_max, beta,gamma_tau,
+    alpha_b, w_vx, alpha_vx, w_vy, alpha_vy, w_yaw, alpha_yaw,
+     w_tau, alpha_tau,
+    w_gait, alpha_gait,
+    eps_vx_by_mode, eps_vy_by_mode, eps_yaw_by_mode,
+    eps_diag_sync, eps_pair_sync, eps_bound_overlap,
+    min_contacts, com_z_by_mode, abs_vz_by_mode, roll_abs_by_mode, pitch_abs_by_mode, 
+    slip_speed_by_mode, cop_com_xy_dist_by_mode, stride_period_by_mode, duty_factor_by_mode,
+    K_REQUIRE_3PLUS, MODE_BOUND, MODE_TROT, MODE_WALK, H_WARMUP_MIN_VALID, DT, 
+    diag_2contact_fraction_min_by_mode
+)
 
-
-def smooth_min(vals, beta=10.0):
-    vals = jnp.asarray(vals)                      
-    return -jnp.log(jnp.sum(jnp.exp(-beta * vals))) / beta
 
 def tanh_norm(rho, alpha):  # bound to [-1,1]
     return jnp.tanh(rho / alpha)
 
+def smooth_min(vals, beta=10.0):
+    vals = jnp.asarray(vals)
+    return -jax.nn.logsumexp(-beta * vals) / beta
+    # return -jnp.log(jnp.sum(jnp.exp(-beta * vals))) / beta
+
+def _valid_mask(H, valid_len):
+    # History is right-aligned (newest appended at end after jp.roll(...).at[-1].set(...))
+    # valid entries are the last `valid_len` rows.
+    idx = jnp.arange(H)
+    return idx >= (H - valid_len)
+
+def _masked_min(x, mask):
+    x = jnp.asarray(x)
+    m = jnp.asarray(mask)
+    while m.ndim < x.ndim:
+        m = m[..., None]
+    x_masked = jnp.where(m, x, jnp.inf)
+    return jnp.min(x_masked)
+
+def _masked_mean(x, mask):
+    x = jnp.asarray(x)
+    m = jnp.asarray(mask, dtype=x.dtype)
+    while m.ndim < x.ndim:
+        m = m[..., None]
+    denom = jnp.maximum(jnp.sum(m), 1.0)
+    return jnp.sum(x * m) / denom
+
+def _gait_shape_margin(contact_hist, mode, mask,
+                       eps_diag_sync, eps_pair_sync, eps_bound_overlap):
+    """
+    contact_hist: (H,4) with order [FL, HL, FR, HR]
+    mode: int {0,1,2} = walk, trot, bound
+    returns rho_gait_shape (higher is better)
+    """
+    c = contact_hist.astype(jnp.float32)
+
+    # Index map based on your foot order in Barkour.py:
+    # [front_left, hind_left, front_right, hind_right] = [FL, HL, FR, HR]
+    FL, HL, FR, HR = 0, 1, 2, 3
+
+    # Generic counts
+    nlegs = jnp.sum(c, axis=1)  # (H,)
+
+    # --- Walk / walking-trot proxy ---
+    # Encourage >=2 stance contacts (no flight), especially in slow regime.
+    walk_no_flight_margin = _masked_min(nlegs - 2.0, mask)
+
+    # --- Trot proxy ---
+    # Diagonal pair sync: FL~HR, FR~HL
+    trot_diag_sync_err = 0.5 * (
+        _masked_mean(jnp.abs(c[:, FL] - c[:, HR]), mask) +
+        _masked_mean(jnp.abs(c[:, FR] - c[:, HL]), mask)
+    )
+    trot_margin = eps_diag_sync - trot_diag_sync_err
+
+    # --- Bound proxy ---
+    # Front pair sync + hind pair sync
+    bound_pair_sync_err = 0.5 * (
+        _masked_mean(jnp.abs(c[:, FL] - c[:, FR]), mask) +
+        _masked_mean(jnp.abs(c[:, HL] - c[:, HR]), mask)
+    )
+    front_occ = 0.5 * (c[:, FL] + c[:, FR])
+    hind_occ  = 0.5 * (c[:, HL] + c[:, HR])
+    fore_hind_overlap = _masked_mean(front_occ * hind_occ, mask)
+    bound_margin = smooth_min([
+        eps_pair_sync - bound_pair_sync_err,
+        eps_bound_overlap - fore_hind_overlap,
+    ], beta=10.0)
+
+    # mode-select
+    return jnp.where(
+        mode == 0,
+        walk_no_flight_margin,
+        jnp.where(mode == 1, trot_margin, bound_margin)
+    )
+
 def softsign_p(x, p=2.0):
     return x / jnp.power(1.0 + jnp.abs(x)**p, 1.0/p)
 
-def dist_in_poly(y, poly, valid_count):  # signed; positive inside
-    # poly: list of 2D vertices counterclockwise
-    # poly: (N,2) but only the first valid_count rows are real vertices.
-    
-    """if len(poly) < 3:
-        return -1e6
-    dists = []
-    n = len(poly)
-    for i in range(n):
-        a = np.array(poly[i])
-        b = np.array(poly[(i+1)%n])
-        edge = b - a
-        n_in = np.array([ -edge[1], edge[0] ])  # CCW inward normal
-        n_in = n_in / (np.linalg.norm(n_in)+1e-12)
-        dists.append( np.dot(n_in, (np.array(y)-a)) )
-    return min(dists)"""
 
-    N = poly.shape[0]
-
-    def compute(_):
-        idx = jnp.arange(N, dtype=jnp.int32)
-        idx_next = jnp.where(idx + 1 < valid_count, idx + 1, jnp.int32(0))
-
-        a = poly[idx]        # (N,2)
-        b = poly[idx_next]   # (N,2)
-        edge = b - a         # (N,2)
-
-        # CCW inward normal [-ey, ex]
-        n_in = jnp.stack([-edge[:, 1], edge[:, 0]], axis=1)                 # (N,2)
-        n_in = n_in / (jnp.linalg.norm(n_in, axis=1, keepdims=True) + 1e-12)
-
-        # Distance of point y to each supporting line (inward normal)
-        d = jnp.einsum('ij,ij->i', n_in, (y[None, :] - a))                  # (N,)
-
-        # Ignore padded edges by setting them to +inf before min
-        d = jnp.where(idx < valid_count, d, jnp.inf)
-        return jnp.min(d)  
-
-    # If we don't have at least a line, return a large negative sentinel
-    return lax.cond(valid_count >= 2, compute,
-        lambda _: jnp.array(-1e6, dtype=poly.dtype),operand=None,)
-    
-
-def find_first_real_vertex(polygon, max_vertices):
-    # Your loop's initial state. Here, just the index 'count'.
-    init_count = 0
-
-    # 1. Condition Function:
-    #    Takes the loop state (count) and returns True to continue looping.
-    def cond_fun(count):
-        # Check 1: Are we still a zero vertex?
-        # (jnp.all is a cleaner way to write your check)
-        is_zero_vertex = jnp.all(polygon[count] == 0)
-        
-        # Check 2: Are we still in bounds? (IMPORTANT!)
-        is_in_bounds = count < max_vertices
-        
-        # Continue WHILE both are true
-        return jnp.logical_and(is_zero_vertex, is_in_bounds)
-
-    # 2. Body Function:
-    #    Takes the loop state (count) and returns the *new* state.
-    def body_fun(count):
-        # Just increment the count
-        return count + 1
-
-    # 3. Run the JAX-native while loop
-    #    This will run `body_fun` as long as `cond_fun` returns True.
-    first_real_index = jax.lax.while_loop(cond_fun, body_fun, init_count)
-
-    return first_real_index
-
-
-def point_in_polygon_not_used(pt, poly):
-    # https://www.geeksforgeeks.org/dsa/how-to-check-if-a-given-point-lies-inside-a-polygon/
-    # Ray casting algorithm
-    
-    polygon = poly
-    num_vertices = 4  # polygon.shape[0]
-    x, y = pt
-    inside = False
-
-    count = find_first_real_vertex(polygon, num_vertices)
-    p1 = polygon[count]
-    
-    polygon = jnp.vstack((polygon, p1))
-
-    count_host = jax.device_get(count) 
-    i = count_host.item()
-    while i < num_vertices:
-        count = find_first_real_vertex(polygon[i+1:,:], num_vertices-i)
-        count_host = jax.device_get(count)
-        i = i + count_host.item() + 1
-        p2 = polygon[i]
-            
-        # Check if the point is above the minimum y coordinate of the edge
-        if y > min(p1[1], p2[1]):
-            # Check if the point is below the maximum y coordinate of the edge
-            if y <= max(p1[1], p2[1]):
-                # Check if the point is to the left of the maximum x coordinate of the edge
-                if x <= max(p1[0], p2[0]):
-                    # Calculate the x-intersection of the line connecting the point to the edge
-                    x_intersection = (y - p1[1]) * (p2[0] - p1[0]) / (p2[1] - p1[1]) + p1[0]
-
-                    # Check if the point is on the same line as the edge or to the left of the x-intersection
-                    if p1[0] == p2[0] or x <= x_intersection:
-                        # Flip the inside flag
-                        inside = not inside
-
-        p1 = p2
-
-    return inside
-
-def _is_zero_rows(arr, tol=1e-8):
-    # Row is treated as zero if all coordinates are ~0
-    return jnp.all(jnp.isclose(arr, 0.0, atol=tol), axis=1)
-
-def _first_true(mask):
-    # index of first True; 0 if none True
-    n = mask.shape[0]
-    idx = jnp.arange(n)
-    ranked = jnp.where(mask, idx, idx + n)
-    return jnp.argmin(ranked)
-
-def _next_true(mask, i):
-    # next index > i (cyclic) where mask[j] is True
-    n = mask.shape[0]
-    steps = jnp.arange(1, n + 1)
-    js = (i + steps) % n
-    ok = mask[js]
-    ranked = jnp.where(ok, steps, steps + n)
-    step = jnp.argmin(ranked) + 1
-    return (i + step) % n
-
-def _ordered_indices_of_valid_vertices(valid):
-    # Return up to 4 indices in cyclic order starting at first True.
-    start = _first_true(valid)
-    def body(i, _):
-        j = _next_true(valid, i)
-        return j, j
-    # Collect 3 subsequent indices (max polygon size = 4)
-    _, rest = lax.scan(body, start, xs=None, length=3)  # (3,)
-    return jnp.concatenate([jnp.array([start]), rest], axis=0)  # (4,)
-
-def point_in_polygon(pt, poly, tol_zero=1e-8, tol_edge=1e-8):
-    """
-    Tri-valued point-in-polygon for a (4,3) array with zero-row masking.
-
-    Returns:
-      +1.0 if pt is inside OR on an edge,
-      -1.0 if pt is outside,
-       0.0 if fewer than 3 valid vertices (2+ rows are zero).
-    """
-    xy = poly[:, :2]                    # use x,y only
-    valid = ~_is_zero_rows(poly, tol_zero)   # (4,)
-    K = jnp.sum(valid)                        # number of real vertices
-
-    def compute(_):
-        idxs = _ordered_indices_of_valid_vertices(valid)   # (4,)
-        verts = xy[idxs]                                   # (4,2)
-        # Edge list uses wrap-around
-        v1 = verts
-        v2 = jnp.roll(verts, -1, axis=0)
-
-        # Only first K edges are real (others are placeholders)
-        edge_mask = jnp.arange(4) < K
-
-        x, y = pt[0], pt[1]
-        x1, y1 = v1[:, 0], v1[:, 1]
-        x2, y2 = v2[:, 0], v2[:, 1]
-        dx, dy = x2 - x1, y2 - y1
-
-        # --- 1) Explicit on-edge test (robust to floating error) ---
-        cross = (y - y1) * dx - (x - x1) * dy     # 2D cross product
-        colinear = jnp.abs(cross) <= tol_edge
-        dot = (x - x1) * dx + (y - y1) * dy
-        seg_len2 = dx * dx + dy * dy
-        within = (dot >= -tol_edge) & (dot <= seg_len2 + tol_edge)
-        on_edge = edge_mask & colinear & within
-
-        any_on_edge = jnp.any(on_edge)
-        def on_edge_branch(_):
-            return jnp.array(1.0, xy.dtype)
-
-        # --- 2) Even–odd (ray casting) with strict '<' (boundary handled above) ---
-        def inside_outside(_):
-            straddles = jnp.logical_xor(y1 > y, y2 > y)
-            # denom nonzero when straddles; safe to divide
-            denom = y2 - y1
-            x_intersect = (x2 - x1) * (y - y1) / denom + x1
-            crosses = edge_mask & straddles & (x < x_intersect)
-            inside = jnp.logical_xor.reduce(crosses)
-            return jnp.where(inside, jnp.array(1.0, xy.dtype),
-                                     jnp.array(-1.0, xy.dtype))
-
-        return lax.cond(any_on_edge, on_edge_branch, inside_outside, operand=None)
-
-    # Not enough vertices → 0.0
-    return lax.cond(K >= 3,
-                    compute,
-                    lambda _: jnp.array(0.0, xy.dtype),
-                    operand=None)
-
-
+"""
 def cop_from_cfrc_ext(model: mujoco.MjModel,
                       data: mujoco.MjData,
                       foot_body_names=( 'foot_front_left',
@@ -252,8 +129,9 @@ def cop_from_cfrc_ext(model: mujoco.MjModel,
     cop = np.array([-M[1]/Fz, M[0]/Fz])  # (x,y) on plane z=plane_z
     return cop, Fz, F, M
     #return np.array([3, 5]), 0.1, np.random.rand((4,3)), np.random.rand((4,3))
+    """
 
-def friction_cone_margin(model, data, Fz_min=Fz_min, delta=0.0):
+"""def friction_cone_margin(model, data, Fz_min=Fz_min, delta=0.0):
     # returns the worst (minimum) margin across all active foot-ground contacts
     worst = np.inf
     tmp = np.zeros(6)  
@@ -271,121 +149,190 @@ def friction_cone_margin(model, data, Fz_min=Fz_min, delta=0.0):
         m = min(m1, m2, mFz) - delta
         worst = min(worst, m)
     # If no contacts, return a large negative (violated/undefined)
-    return worst if worst < np.inf else -1e6
+    return worst if worst < np.inf else -1e6"""
 
 
-def reward_step(model, data, input, commands):
-   
-    # 1-) Torque Limits 
-    # 2-) Center of Mass within the Support Polygon for Static Stability
-    # 3-) Increased Size of Support Polygon (more legs on the ground)
-    # 4-) Zero Moment Point (ZMP) within the Support Polygon for Dynamic Stability
-    # 5-) Velocity tracking
-    # 6-) Heading tracking
-    # 7-) Contact force limits due to friction cone constraints
-    # NOT USED! Equal to 4 8-) Center of pressure (CoP) remaining in the support polygon constraints  (SAME WITH #4 ??)
+def reward_step(reward_input, commands, mode, valid_len, weights_override=None):
+    # histories (all right-aligned)
+    tau = reward_input["tau_history"]                  # (H,12)
+    c   = reward_input["contact_history"].astype(jnp.float32)  # (H,4) [FL,HL,FR,HR]
+    feet_xy = reward_input["feet_history"]             # (H,4,2)
+    com_xy  = reward_input["CoM_history"]              # (H,2)
+    v_hist  = reward_input["lin_velocity_history"]     # (H,3)
+    yaw_hist = reward_input["ang_velocity_history"]    # (H,)
+    com_z_hist = reward_input["com_z_history"]         # (H,)
+    roll_hist  = reward_input["roll_history"]          # (H,) radians
+    pitch_hist = reward_input["pitch_history"]         # (H,) radians
+    slip_hist  = reward_input["slipmax_history"]       # (H,)
+            
+    # reward weights for tuning
+    if weights_override is None:
+        # w = jnp.array([w_vx, w_tau, w_gait, alpha_b, alpha_vx, alpha_tau, alpha_gait, beta], dtype=jnp.float32)
+        w = jnp.array([w_vx, alpha_b, alpha_vx, beta], dtype=jnp.float32)
+    else:
+        w = weights_override
 
-    # mujoco already considers friction cone constraints https://mujoco.readthedocs.io/en/stable/computation/index.html
+    # _w_vx, _w_tau, _w_gait, _alpha_b, _alpha_vx, _alpha_tau, _alpha_gait, _beta = w
+    
+    _w_vx, _alpha_b, _alpha_vx, _beta = w
 
-                        
-    tau = input["tau_history"]              
-    com_xy = input["CoM_history"]       
-    
-    c = input["contact_history"]           
-    poly = input["feet_history"]       
-    
-    v_hist = input["lin_velocity_history"] 
-    yaw = input["ang_velocity_history"] 
-    
-    v_x_star = commands[0] 
-    v_y_star = commands[1] 
-    heading_star = commands[2] 
-    
-    # F --> (fx,fy,fz)
-    cop_xy, Fz, F, _ = cop_from_cfrc_ext(model, data)
-    
-    
-    # R1: Torque limits
-    rho_torque = jnp.min(tau_max - jnp.abs(tau))
-    
-    # R2: CoM in S
-    #flag = point_in_polygon(com_xy, poly) # -1, 0, +1
-    #rho_com = tanh_norm(flag, 0.5)
-    
-    # R3: More legs on the ground
-    rho_nlegs = jnp.sum(c.astype(jnp.float32), axis=1) - 2
-    rho_nlegs = jnp.min(rho_nlegs)
+    H = tau.shape[0]
+    valid_len = jnp.minimum(valid_len, H)
+    mask = _valid_mask(H, valid_len)
 
-    # R4: ZMP/CoP in S
-    #flag2 = point_in_polygon(cop_xy, poly)
-    #rho_cop = tanh_norm(flag2, 0.5)
-    #rho_zmp = min(Fz - Fz_min, rho_cop)
-    #rho_zmp = jnp.minimum(Fz - Fz_min, rho_cop)
+    # commands
+    v_x_star = commands[0]
+    v_y_star = commands[1]
+    yaw_star = commands[2]
 
-    # R5: Velocity tracking
+    # mode-conditioned tolerances
+    eps_vx = jnp.asarray(eps_vx_by_mode)[mode]
+    eps_vy = jnp.asarray(eps_vy_by_mode)[mode]
+    eps_yaw_m = jnp.asarray(eps_yaw_by_mode)[mode]
+
+    # ---------- shared safety ----------
+    # torque limit
+    rho_torque = _masked_min(tau_max - jnp.abs(tau), mask)
+
+    # min contacts
+    n_contacts = jnp.sum(c, axis=1)  # (H,)
+    rho_nlegs = _masked_min(n_contacts - float(min_contacts), mask)
+
+    # COM z floor
+    zmin = jnp.asarray(com_z_by_mode)[mode]
+    rho_comz = _masked_min(com_z_hist - zmin, mask)
+
+    # |vz| bound (use v_hist[:,2])
+    vzmax = jnp.asarray(abs_vz_by_mode)[mode]
+    rho_vz = _masked_min(vzmax - jnp.abs(v_hist[:, 2]), mask)
+
+    # roll/pitch bounds
+    roll_max = jnp.asarray(roll_abs_by_mode)[mode] * jnp.pi / 180.0
+    pitch_max = jnp.asarray(pitch_abs_by_mode)[mode] * jnp.pi / 180.0
+    rho_roll = _masked_min(roll_max - jnp.abs(roll_hist), mask)
+    rho_pitch = _masked_min(pitch_max - jnp.abs(pitch_hist), mask)
+
+    # slip bound
+    slipmax = jnp.asarray(slip_speed_by_mode)[mode]
+    rho_slip = _masked_min(slipmax - slip_hist, mask)
+
+    # COM-to-stance-centroid distance proxy (JAX-safe replacement for COP–COM)
+    denom = jnp.maximum(jnp.sum(c, axis=1, keepdims=True), 1.0)      # (H,1)
+    centroid = jnp.sum(c[:, :, None] * feet_xy, axis=1) / denom      # (H,2)
+    support_dist = jnp.linalg.norm(com_xy - centroid, axis=1)        # (H,)
+    dmax = jnp.asarray(cop_com_xy_dist_by_mode)[mode]
+    rho_support = _masked_min(dmax - support_dist, mask)
+
+    rho_safety = smooth_min([rho_torque / 5.0, 
+                            # rho_nlegs, 
+                             rho_comz / 0.03, 
+                            # rho_vz / 0.10, 
+                             rho_roll / (5.0 * jnp.pi/180.0), 
+                             rho_pitch / (5.0 * jnp.pi/180.0), 
+                             rho_slip / 0.30, 
+                             ], beta=_beta)
+
+    # ---------- tracking ----------
     v_x_error_hist = jnp.abs(v_hist[:, 0] - v_x_star)
-    rho_v_x = jnp.min(eps_v - v_x_error_hist)
     v_y_error_hist = jnp.abs(v_hist[:, 1] - v_y_star)
-    rho_v_y = jnp.min(eps_v - v_y_error_hist)
+    yaw_error_hist = jnp.abs(yaw_hist - yaw_star)
 
-    # R6: Heading tracking
-    yaw_error_hist = jnp.abs(yaw - heading_star)
-    rho_yaw = jnp.min(eps_yaw - yaw_error_hist)
-    
-    # Error Tracking During Training
-    rho_v_x_error = jnp.min(v_x_error_hist)
-    rho_v_y_error = jnp.min(v_y_error_hist)
-    rho_yaw_error = jnp.min(yaw_error_hist)
+    rho_v_x = _masked_min(eps_vx - v_x_error_hist, mask)
+    rho_v_y = _masked_min(eps_vy - v_y_error_hist, mask)
+    rho_yaw = _masked_min(eps_yaw_m - yaw_error_hist, mask)
 
-    # R7: Friction cones (optinal)  
-    #rho_cone = friction_cone_margin(model, data, Fz_min, delta=.5)
+    rho_v_x_error = _masked_mean(v_x_error_hist, mask)
+    rho_v_y_error = _masked_mean(v_y_error_hist, mask)
+    rho_yaw_error = _masked_mean(yaw_error_hist, mask)
 
-    
-    # Safety 
-    rho_safety = smooth_min(vals=[rho_torque]) # rho_torque
+    # ---------- gait-shape ----------
+    # Don’t enforce gait-shape too early (no history)
+    gait_enabled = valid_len >= H_WARMUP_MIN_VALID
 
-    # Penalty for effort/energy
-    tau_joint = jnp.sum(jnp.square(input["tau_history"]), axis=1)
-    tau_dot = jnp.mean(tau_joint)  # mean over the temporal horizon (if you wanna be strict, use max)
+    FL, HL, FR, HR = 0, 1, 2, 3
+    mask2 = (n_contacts == 2.0)
+    diag2 = ((c[:, FL] == 1) & (c[:, HR] == 1) & (c[:, HL] == 0) & (c[:, FR] == 0)) | \
+            ((c[:, FR] == 1) & (c[:, HL] == 1) & (c[:, FL] == 0) & (c[:, HR] == 0))
 
-    # Rewards
+    # diag2 fraction over valid window
+    num2 = _masked_mean(diag2.astype(jnp.float32) * mask2.astype(jnp.float32), mask)
+    den2 = _masked_mean(mask2.astype(jnp.float32), mask)
+    diag2_frac = num2 / jnp.maximum(den2, 1e-6)
+
+    diag2_min = jnp.asarray(diag_2contact_fraction_min_by_mode)[mode]
+    rho_diag2 = diag2_frac - diag2_min
+
+    # stride estimate from touchdown count (rough but JAX-safe)
+    c01 = c.astype(jnp.int32)
+    td = (c01[1:] == 1) & (c01[:-1] == 0)        # (H-1,4)
+    mask_td = mask[1:]
+    td_counts = jnp.sum(td.astype(jnp.float32) * mask_td[:, None].astype(jnp.float32), axis=0)  # (4,)
+    td_mean = jnp.mean(td_counts)
+    valid_steps = jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
+    stride_steps_est = valid_steps / jnp.maximum(td_mean, 1.0)
+    stride_sec_est = stride_steps_est * DT
+
+    stride_bounds = jnp.asarray(stride_period_by_mode) # Shape (N, 2)
+    duty_bounds = jnp.asarray(duty_factor_by_mode)     # Shape (N, 2)
     
-    #r = (0.1*rho_safety + rho_v_x + rho_v_y + rho_yaw + 0.5*rho_nlegs + 0.1*rho_torque - gamma_tau*jnp.dot(tau, tau))
-    
-    
+    stride_lo = stride_bounds[mode, 0]
+    stride_hi = stride_bounds[mode, 1]
+    rho_stride = jnp.minimum(stride_sec_est - stride_lo, stride_hi - stride_sec_est)
+
+    # “duty” proxy = per-leg contact fraction (consistent with your logged contacts)
+    duty_leg = jnp.sum(c * mask[:, None].astype(jnp.float32), axis=0) / valid_steps
+    duty_est = jnp.mean(duty_leg)
+    duty_lo = duty_bounds[mode, 0]
+    duty_hi = duty_bounds[mode, 1]
+    rho_duty = jnp.minimum(duty_est - duty_lo, duty_hi - duty_est)
+
+    # walking-trot: require 3+ contact occurs within last K steps
+    K = jnp.minimum(valid_len, K_REQUIRE_3PLUS)
+    idx = jnp.arange(H)
+    lastK_mask = mask & (idx >= (H - K))
+    # event margin: max over last K of (n_contacts-3)
+    event_vals = jnp.where(lastK_mask, n_contacts - 3.0, -jnp.inf)
+    rho_3plus_event = jnp.max(event_vals)
+
+    # bound priors
+    front_sync = _masked_mean(jnp.abs(c[:, FL] - c[:, FR]), mask)
+    hind_sync  = _masked_mean(jnp.abs(c[:, HL] - c[:, HR]), mask)
+    cF = 0.5 * (c[:, FL] + c[:, FR])
+    cH = 0.5 * (c[:, HL] + c[:, HR])
+    overlap = _masked_mean(cF * cH, mask)
+
+    rho_front = eps_pair_sync - front_sync
+    rho_hind  = eps_pair_sync  - hind_sync
+    rho_overlap = eps_bound_overlap - overlap
+
+    rho_bound = smooth_min([rho_front / 0.10, rho_hind / 0.10, rho_overlap / 0.10, rho_duty / 0.075], beta=_beta)  # extra: rho_stride / 0.06
+    rho_walk  = smooth_min([rho_diag2 / 0.05, rho_stride / 0.05, rho_duty / 0.035, rho_3plus_event, rho_support / 0.08], beta=_beta)
+    rho_trot  = smooth_min([rho_diag2 / 0.05, rho_stride / 0.04, rho_duty / 0.31, rho_support / 0.08], beta=_beta)
+
+    rho_gait = jnp.where(mode == MODE_WALK, rho_walk,
+                 jnp.where(mode == MODE_TROT, rho_trot, rho_bound))
+
+    rho_gait = jnp.where(gait_enabled, rho_gait, 0.0)
+
+    # effort
+    tau_sq_sum = jnp.sum(jnp.square(tau), axis=1)  # (H,)
+    tau_effort = _masked_mean(tau_sq_sum, mask)
+
+    # reward: gate gait/tracking on safety
+    #safe_ok = (rho_safety > 0.0).astype(jnp.float32)
     r = (
-        1.0*(tanh_norm(rho_safety, alpha_b)+1)
-        + w_vx*(tanh_norm(rho_v_x, alpha_vx)+1)
-        + w_vy*(tanh_norm(rho_v_y, alpha_vy)+1)
-        + w_yaw*(tanh_norm(rho_yaw, alpha_yaw)+1)
-        #+ w_torque*tanh_norm(rho_torque, alpha_torque)
-        + w_nlegs*(tanh_norm(rho_nlegs, alpha_nlegs)+1)
-        #- gamma_tau*tau_dot
-        - w_tau*(tanh_norm(tau_dot, alpha_tau)+1)
-    )
+        1.0 * (tanh_norm(rho_safety, _alpha_b))
+       # + safe_ok * (
+         +   _w_vx * (tanh_norm(rho_v_x, _alpha_vx))
+            + w_vy * (tanh_norm(rho_v_y, alpha_vy))
+            + w_yaw * (tanh_norm(rho_yaw, alpha_yaw))
+           # + _w_gait * (tanh_norm(rho_gait, _alpha_gait))
+            - gamma_tau * tau_effort     # _w_tau * (tanh_norm(tau_effort, _alpha_tau))
+        )
     
+
+    return (r, tau_effort, rho_safety, rho_torque, rho_comz, rho_roll, rho_pitch, rho_slip, rho_bound, rho_trot, rho_walk,
+            rho_v_x, rho_v_y, rho_yaw, rho_nlegs, rho_gait,
+            rho_v_x_error, rho_v_y_error, rho_yaw_error, rho_diag2, rho_stride, rho_duty, rho_3plus_event, rho_support)
     
-    """r = (
-        1.0*tanh_norm(rho_safety, alpha_b)
-        + w_vx*tanh_norm(rho_v_x, alpha_vx)
-        + w_vy*tanh_norm(rho_v_y, alpha_vy)
-        + w_yaw*tanh_norm(rho_yaw, alpha_yaw)
-        #+ w_torque*tanh_norm(rho_torque, alpha_torque)
-        + w_nlegs*tanh_norm(rho_nlegs, alpha_nlegs)
-        #- gamma_tau*tau_dot
-        - w_tau*tanh_norm(tau_dot, alpha_tau)
-    )"""
-    
-    """r = (
-        1.0*softsign_p(rho_safety)
-        + w_vx*softsign_p(rho_v_x)
-        + w_vy*softsign_p(rho_v_y)
-        + w_yaw*softsign_p(rho_yaw)
-        + w_torque*softsign_p(rho_torque)
-        + w_nlegs*softsign_p(rho_nlegs)
-        - gamma_tau*jnp.dot(tau, tau)
-    )"""
-    
-    return r, tau_dot, rho_safety, rho_torque, rho_v_x, rho_v_y, rho_yaw, \
-           rho_nlegs, rho_v_x_error, rho_v_y_error, rho_yaw_error
 

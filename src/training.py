@@ -94,9 +94,9 @@ make_networks_factory = functools.partial(ppo_networks.make_ppo_networks,
 train_fn = functools.partial(
       ppo.train, num_timesteps=200_000_000, num_evals=10,
       reward_scaling=1, episode_length=1000, normalize_observations=True,
-      action_repeat=1, unroll_length=20, num_minibatches=32,
-      num_updates_per_batch=4, discounting=0.97, learning_rate=3.0e-4,
-      entropy_cost=1e-2, num_envs=8192, batch_size=256,
+      action_repeat=1, unroll_length=10, num_minibatches=32,
+      num_updates_per_batch=4, discounting=0.96, learning_rate=0.00011,
+      entropy_cost=0.00068, num_envs=8192, batch_size=256,
       network_factory=make_networks_factory,
       randomization_fn=domain_randomize,
       policy_params_fn=policy_params_fn,
@@ -108,24 +108,26 @@ df_metrics = pd.DataFrame(columns=[
             "training_policy_loss",
             "training_total_loss",
             "training_v_loss",
+            "eval_episode_rho_diag2",
+            "eval_episode_rho_stride",
+            "eval_episode_rho_duty",
+            "eval_episode_rho_3plus_event",
+            "eval_episode_rho_support",  
             "eval_episode_Ang_vel_track",
-           # "eval_episode_CoM_stab",
-           # "eval_episode_CoP_stab",
             "eval_episode_Vel_track_x",
             "eval_episode_Vel_track_y",
-           # "eval_episode_Zmp_stab",
             "eval_episode_smooth_action",
-           # "eval_episode_autow_com",
-           # "eval_episode_autow_cone",
-           # "eval_episode_autow_cop",
-           # "eval_episode_autow_nlegs",
-           # "eval_episode_autow_torque",
-           # "eval_episode_autow_zmp",
+            "eval_episode_gait_shape",
+            "eval_episode_rho_comz",
+            "eval_episode_rho_roll",
+            "eval_episode_rho_pitch",
+            "eval_episode_rho_slip",
+            "eval_episode_rho_bound",
+            "eval_episode_rho_trot",
+            "eval_episode_rho_walk",
             "eval_episode_combined_safety",
-            #"eval_episode_friction_cone",
             "eval_episode_more_legs_grounded",
             "eval_episode_reward",
-           # "eval_episode_stl_penalty",
             "eval_episode_torque_lim",
             "eval_episode_total_dist",
             "eval_episode_x_error",
@@ -155,36 +157,39 @@ def progress(num_steps, metrics):
     temp_metrics.append(metrics["training/v_loss"])
   except:
     temp_metrics += [0, 0, 0, 0]
-  temp_metrics.append(metrics["eval/episode_Ang_vel_track"])
-#  temp_metrics.append(metrics["eval/episode_CoM_stab"])
-#  temp_metrics.append(metrics["eval/episode_CoP_stab"])
-  temp_metrics.append(metrics["eval/episode_Vel_track_x"])
-  temp_metrics.append(metrics["eval/episode_Vel_track_y"])
-#  temp_metrics.append(metrics["eval/episode_Zmp_stab"])
-  temp_metrics.append(metrics["eval/episode_smooth_action"])
-#  temp_metrics.append(metrics["eval/episode_autow_com"])
-#  temp_metrics.append(metrics["eval/episode_autow_cone"])
-#  temp_metrics.append(metrics["eval/episode_autow_cop"])
-#  temp_metrics.append(metrics["eval/episode_autow_nlegs"])
-#  temp_metrics.append(metrics["eval/episode_autow_torque"])
-#  temp_metrics.append(metrics["eval/episode_autow_zmp"])
-  temp_metrics.append(metrics["eval/episode_combined_safety"])
-#  temp_metrics.append(metrics["eval/episode_friction_cone"])
-  temp_metrics.append(metrics["eval/episode_more_legs_grounded"])
-  temp_metrics.append(metrics["eval/episode_reward"])
-#  temp_metrics.append(metrics["eval/episode_stl_penalty"])
-  temp_metrics.append(metrics["eval/episode_torque_lim"])
-  temp_metrics.append(metrics["eval/episode_total_dist"])
-  temp_metrics.append(metrics["eval/episode_x_error"])
-  temp_metrics.append(metrics["eval/episode_y_error"])
-  temp_metrics.append(metrics["eval/episode_yaw_error"])
-  temp_metrics.append(metrics["eval/avg_episode_length"])
+    
+  temp_metrics.append(metrics.get("eval/episode_rho_diag2", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_stride", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_duty", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_3plus_event", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_support", np.nan))         
+  temp_metrics.append(metrics.get("eval/episode_Ang_vel_track", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_Vel_track_x", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_Vel_track_y", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_smooth_action", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_gait_shape", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_comz", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_roll", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_pitch", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_slip", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_bound", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_trot", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_rho_walk", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_combined_safety", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_more_legs_grounded", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_reward", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_torque_lim", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_total_dist", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_x_error", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_y_error", np.nan))
+  temp_metrics.append(metrics.get("eval/episode_yaw_error", np.nan))
+  temp_metrics.append(metrics.get("eval/avg_episode_length", np.nan))
   
   df_metrics.loc[len(df_metrics)] = temp_metrics
   
   temp_metrics = []
   
-  if num_steps >= 199999990:  # 999999999
+  if num_steps >= 19999999:  # 999999999
      df_metrics.to_csv("metricssaved.csv", sep="|")
 
   #plt.autoscale(enable=True, axis="both", tight=True)

@@ -39,8 +39,13 @@ from brax.training.agents.ppo import networks as ppo_networks
 from brax.io import html, mjcf, model
 
 from reward_config import get_config, get_stl_config
-from stl_reward import reward_step # cop_from_cfrc_ext, friction_cone_margin
-from coeff_config import H
+from stl_reward import reward_step 
+from coeff_config import (
+    H,
+    MODE_WALK, MODE_TROT, MODE_BOUND,
+    WALK_TO_TROT_ENTER, TROT_TO_WALK_EXIT,
+    TROT_TO_BOUND_ENTER, BOUND_TO_TROT_EXIT,
+)
 
 os.environ['MUJOCO_GL']='egl'  # Configure MuJoCo to use the EGL rendering backend (requires GPU)
 
@@ -65,6 +70,7 @@ class BarkourEnv(PipelineEnv):
       action_scale: float = 0.3,
       kick_vel: float = 0.05,
       scene_file: str = 'scene_mjx.xml',
+      reward_weights=None,
       **kwargs,
   ):
     path = BARKOUR_ROOT_PATH / scene_file
@@ -81,9 +87,6 @@ class BarkourEnv(PipelineEnv):
 
     n_frames = kwargs.pop('n_frames', int(self._dt / sys.opt.timestep))
     super().__init__(sys, backend='mjx', n_frames=n_frames)
-    
-    self._mj_model = sys.mj_model
-    self._mj_data = mujoco.MjData(sys.mj_model)
 
     if STL_REWARD:
       self.reward_config = get_stl_config()
@@ -99,6 +102,23 @@ class BarkourEnv(PipelineEnv):
     self._torso_idx = mujoco.mj_name2id(
         sys.mj_model, mujoco.mjtObj.mjOBJ_BODY.value, 'torso'
     )
+    if reward_weights is None:
+        self.reward_weights = None
+    else:
+        self.reward_weights = jp.array(
+            [reward_weights["w_vx"],
+          #  reward_weights["w_tau"],
+           # reward_weights["w_gait"],
+            
+            reward_weights["alpha_b"],
+            reward_weights["alpha_vx"],
+          #  reward_weights["alpha_tau"],
+          #  reward_weights["alpha_gait"],
+            reward_weights["beta"]
+            ],
+            dtype=jp.float32
+        )
+        
     self._action_scale = action_scale
     self._obs_noise = obs_noise
     self._kick_vel = kick_vel
@@ -132,11 +152,23 @@ class BarkourEnv(PipelineEnv):
     self._lower_leg_body_id = np.array(lower_leg_body_id)
     self._foot_radius = 0.0175
     self._nv = sys.nv
+    
+  
+  def _update_mode_hysteresis(self, mode: jax.Array, command: jax.Array) -> jax.Array:
+    vx = jp.abs(command[0])
+
+    mode = jp.where((mode == MODE_WALK) & (vx >= WALK_TO_TROT_ENTER), MODE_TROT, mode)
+    mode = jp.where((mode == MODE_TROT) & (vx <= TROT_TO_WALK_EXIT),  MODE_WALK, mode)
+
+    mode = jp.where((mode == MODE_TROT) & (vx >= TROT_TO_BOUND_ENTER), MODE_BOUND, mode)
+    mode = jp.where((mode == MODE_BOUND) & (vx <= BOUND_TO_TROT_EXIT), MODE_TROT, mode)
+    return mode  # self.mode = new_mode
+  
 
   def sample_command(self, rng: jax.Array) -> jax.Array:
-    lin_vel_x = [-0.6, 1.5]  # min max [m/s]
-    lin_vel_y = [-0.8, 0.8]  # min max [m/s]
-    ang_vel_yaw = [-0.7, 0.7]  # min max [rad/s]
+    lin_vel_x = [0.0, 1.6]  # min max [m/s]
+    lin_vel_y = [-0.2, 0.2]  # min max [m/s]
+    ang_vel_yaw = [-0.2, 0.2]  # min max [rad/s]
 
     _, key1, key2, key3 = jax.random.split(rng, 4)
     lin_vel_x = jax.random.uniform(
@@ -167,12 +199,19 @@ class BarkourEnv(PipelineEnv):
         'kick': jp.array([0.0, 0.0]),
         'step': 0,
         
-        'tau_history': jp.zeros((self._H, 12)), 
+        'history_len': jp.array(0, dtype=jp.int32),
+        'mode': jp.array(MODE_WALK, dtype=jp.int32),
+        
+        'tau_history': jp.zeros((self._H, 18)), 
         'CoM_history': jp.zeros((self._H, 2)),
         'contact_history': jp.zeros((self._H, 4)),
         'feet_history': jp.zeros((self._H, 4, 2)),
         'lin_velocity_history': jp.zeros((self._H, 3)),
-        'ang_velocity_history': jp.zeros((self._H, 1)),
+        'ang_velocity_history': jp.zeros((self._H,)),
+        'com_z_history': jp.zeros((self._H,)),
+        'roll_history': jp.zeros((self._H,)),
+        'pitch_history': jp.zeros((self._H,)),
+        'slipmax_history': jp.zeros((self._H,)),
     }
 
     obs_history = jp.zeros(15 * 31)  # store 15 steps of history
@@ -227,8 +266,21 @@ class BarkourEnv(PipelineEnv):
     # update history buffers
     local_vel = math.rotate(xd.vel[0], math.quat_inv(x.rot[0]))
     base_ang_vel = math.rotate(xd.ang[0], math.quat_inv(x.rot[0]))
+    
+    inv_torso_rot = math.quat_inv(x.rot[0])
+    g_body = math.rotate(jp.array([0.0, 0.0, -1.0]), inv_torso_rot)
+    roll = jp.atan2(g_body[1], g_body[2]) 
+    pitch = jp.atan2(-g_body[0], jp.sqrt(g_body[1] * g_body[1] + g_body[2] * g_body[2])) 
+    
+    # slip proxy from finite-diff feet xy (using previous feet_history[-1])
+    prev_feet_xy = state.info['feet_history'][-1]
+    curr_feet_xy = pipeline_state.site_xpos[self._feet_site_id][:, :2]
+    feet_vel_xy = (curr_feet_xy - prev_feet_xy) / self.dt
+    feet_speed = jp.sqrt(jp.sum(feet_vel_xy * feet_vel_xy, axis=1))
+    slipmax = jp.max(jp.where(contact, feet_speed, 0.0))
+    
       
-    tau_history = jp.roll(state.info['tau_history'], -1, axis=0).at[-1].set(pipeline_state.qfrc_actuator[:12])
+    tau_history = jp.roll(state.info['tau_history'], -1, axis=0).at[-1].set(pipeline_state.qfrc_actuator)
     CoM_history = jp.roll(state.info['CoM_history'], -1, axis=0).at[-1].set(pipeline_state.subtree_com[0].copy()[:2])
     contact_history = jp.roll(state.info['contact_history'], -1, axis=0).at[-1].set(contact)
     
@@ -236,6 +288,13 @@ class BarkourEnv(PipelineEnv):
     lin_velocity_history = jp.roll(state.info['lin_velocity_history'], -1, axis=0).at[-1].set(local_vel)
     ang_velocity_history = jp.roll(state.info['ang_velocity_history'], -1, axis=0).at[-1].set(base_ang_vel[2])
     
+    com_z_history = jp.roll(state.info['com_z_history'], -1).at[-1].set(pipeline_state.subtree_com[0, 2])
+    roll_history  = jp.roll(state.info['roll_history'], -1).at[-1].set(roll)
+    pitch_history = jp.roll(state.info['pitch_history'], -1).at[-1].set(pitch)
+    slipmax_history = jp.roll(state.info['slipmax_history'], -1).at[-1].set(slipmax)
+    
+    history_len = jp.minimum(state.info['history_len'] + 1, self._H)
+    mode = self._update_mode_hysteresis(state.info['mode'], state.info['command'])
 
     # calculate reward
     
@@ -248,41 +307,52 @@ class BarkourEnv(PipelineEnv):
                         'feet_history': feet_history,
                         'lin_velocity_history': lin_velocity_history,
                         'ang_velocity_history': ang_velocity_history,
-                      }
+                        'com_z_history': com_z_history,
+                        'roll_history': roll_history,
+                        'pitch_history': pitch_history,
+                        'slipmax_history': slipmax_history,
+                                    }
       
       
-      r, tau_dot, rho_safety, rho_torque, \
-       rho_v_x, rho_v_y, rho_yaw, rho_nlegs, rho_v_x_error, rho_v_y_error, rho_yaw_error = reward_step(self._mj_model, 
-                                                                                                                self._mj_data,
-                                                                                                                reward_input, 
-                                                                                                                state.info['command'], 
-                                                                                                                         )
+      (r, tau_effort, rho_safety, rho_torque, rho_comz, rho_roll, rho_pitch, rho_slip, rho_bound, rho_trot, rho_walk,
+        rho_v_x, rho_v_y, rho_yaw, rho_nlegs, rho_gait,
+        rho_v_x_error, rho_v_y_error, rho_yaw_error,
+        rho_diag2, rho_stride, rho_duty, rho_3plus_event, rho_support) = reward_step(
+          reward_input=reward_input,
+          commands=state.info['command'],
+          mode=mode,
+          valid_len=history_len,
+          weights_override=self.reward_weights,)
 
     
       rewards = {
+          'rho_comz': rho_comz,
+          'rho_roll': rho_roll,
+          'rho_pitch': rho_pitch,
+          'rho_slip': rho_slip,
+          'rho_bound': rho_bound,
+          'rho_trot': rho_trot,
+          'rho_walk': rho_walk,
           'combined_safety': rho_safety,
           'torque_lim': rho_torque,
-        #  'CoM_stab': rho_com,
           'more_legs_grounded': rho_nlegs,
-        #  'Zmp_stab': rho_zmp,
           'Vel_track_x': rho_v_x,
           'Vel_track_y': rho_v_y,
           'Ang_vel_track': rho_yaw,
-        #  'friction_cone': rho_cone,
-         # 'CoP_stab': rho_cop,
-          'smooth_action': tau_dot
-      }
-      
-      rewards.update({
-          
+          'gait_shape': rho_gait,
+          'smooth_action': tau_effort,
           'x_error': rho_v_x_error,
           'y_error': rho_v_y_error,
-          'yaw_error': rho_yaw_error
-      })
+          'yaw_error': rho_yaw_error,
+          'rho_diag2': rho_diag2, 
+          'rho_stride': rho_stride, 
+          "rho_duty": rho_duty, 
+          "rho_3plus_event": rho_3plus_event, 
+          "rho_support": rho_support
+          }
       
-      #reward = r * self.dt
       
-      reward = jp.clip(r * self.dt, 0.0, 10000.0)
+      reward = jp.clip(r * self.dt, -100.0, 10000.0)
        
     else:             
       rewards = {             
@@ -329,9 +399,16 @@ class BarkourEnv(PipelineEnv):
     state.info['feet_history'] = feet_history
     state.info['lin_velocity_history'] = lin_velocity_history
     state.info['ang_velocity_history'] = ang_velocity_history
+    
+    state.info['com_z_history'] = com_z_history
+    state.info['roll_history'] = roll_history
+    state.info['pitch_history'] = pitch_history
+    state.info['slipmax_history'] = slipmax_history
+    
+    state.info['history_len'] = history_len
+    state.info['mode'] = mode
 
-    # increment episode count only when an episode ends
-   # state.info['episode'] = state.info['episode'] + (done > 0).astype(jp.int32)
+    command_reset = done | (state.info['step'] > 500)
 
     # sample new command if more than 500 timesteps achieved
     state.info['command'] = jp.where(
@@ -343,6 +420,18 @@ class BarkourEnv(PipelineEnv):
     state.info['step'] = jp.where(
         done | (state.info['step'] > 500), 0, state.info['step']
     )
+    
+    # This makes the [t-H, t] reward window consistent with the current command.
+    def _maybe_clear(buf):
+      return jp.where(command_reset, jp.zeros_like(buf), buf)
+
+    state.info['tau_history'] = _maybe_clear(state.info['tau_history'])
+    state.info['CoM_history'] = _maybe_clear(state.info['CoM_history'])
+    state.info['contact_history'] = _maybe_clear(state.info['contact_history'])
+    state.info['feet_history'] = _maybe_clear(state.info['feet_history'])
+    state.info['lin_velocity_history'] = _maybe_clear(state.info['lin_velocity_history'])
+    state.info['ang_velocity_history'] = _maybe_clear(state.info['ang_velocity_history'])
+    state.info['history_len'] = jp.where(command_reset, jp.array(0, dtype=jp.int32), state.info['history_len'])
 
     # log total displacement as a proxy metric
     state.metrics['total_dist'] = math.normalize(x.pos[self._torso_idx - 1])[1]
