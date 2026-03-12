@@ -93,11 +93,24 @@ def get_stl_config():
                    # friction_cone = 1.0,
                    # CoP_stab = 1.0,
                     smooth_action = 1.0,
+                    gait_shape = 1.0,
+                    rho_comz = 1.0,
+                    rho_roll = 1.0,
+                    rho_pitch = 1.0,
+                    rho_slip = 1.0,
+                    rho_bound = 1.0,
+                    rho_trot = 1.0,
+                    rho_walk = 1.0,
                     
+                    x_error = 0.0,
+                    y_error = 0.0,
+                    yaw_error = 0.0,
                     
-                    x_error = None,
-                    y_error = None,
-                    yaw_error = None
+                    rho_diag2 = 1.0, 
+                    rho_stride = 1.0, 
+                    rho_duty = 1.0, 
+                    rho_3plus_event = 1.0, 
+                    rho_support = 1.0
       
                     
                 )
