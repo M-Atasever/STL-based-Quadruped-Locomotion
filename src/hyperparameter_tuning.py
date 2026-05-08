@@ -19,10 +19,10 @@ make_networks_factory = functools.partial(ppo_networks.make_ppo_networks,
                                           policy_hidden_layer_sizes=(128, 128, 128, 128))
 
 train_fn = functools.partial(
-      ppo.train, num_timesteps=10_000_000, num_evals=10,
+      ppo.train, num_timesteps=100_000_000, num_evals=10,
       reward_scaling=1, episode_length=1000, normalize_observations=True,
       action_repeat=1, num_minibatches=32,
-      num_updates_per_batch=4, num_envs=4096, batch_size=256,
+      num_updates_per_batch=4, num_envs=512, batch_size=256,
       network_factory=make_networks_factory,
       seed=0)
 
@@ -37,18 +37,22 @@ def objective(trial: optuna.Trial):
 
     raw = raw / raw.sum()"""
     
-    reward_weights = {
+    """reward_weights = {
             "w_vx": trial.suggest_float("w_vx",     1e-2, 5.0, log=True),  # float(raw[0]),
            # "w_tau": trial.suggest_float("w_tau",    1e-3, 1.0, log=True),  # float(raw[1]),
            # "w_gait": trial.suggest_float("w_gait",   1e-2, 3.0, log=True),  # float(raw[2]),
+            "w_vy": trial.suggest_float("w_vy",     1e-2, 1.0, log=True),
+            "w_yaw": trial.suggest_float("w_yaw",     1e-2, 1.0, log=True),
             
             "alpha_b": trial.suggest_categorical('alpha_b', [5.0, 20.0, 200.0]),
-            "alpha_vx": trial.suggest_categorical('alpha_vx', [0.5, 1.0, 5.0]),
+            "alpha_vx": trial.suggest_categorical('alpha_vx', [0.5, 1.0, 5.0, 10.0, 20.0]),
+            "alpha_vy": trial.suggest_categorical('alpha_vy', [0.5, 1.0, 5.0, 10.0, 20.0]),
+            "alpha_yaw": trial.suggest_categorical('alpha_yaw', [0.5, 1.0, 5.0, 10.0, 20.0]),
             #"alpha_tau": trial.suggest_categorical('alpha_tau', [50.0, 100.0, 300.0]),
             #"alpha_gait": trial.suggest_categorical('alpha_gait', [1.0, 10.0, 50.0]),
             
             "beta": trial.suggest_categorical('beta', [0.5, 2.0, 5.0, 10.0]),
-        }
+        }"""
         
     # --- 2. PPO Hyperparameter Suggestions ---
     ppo_params = {
@@ -56,14 +60,14 @@ def objective(trial: optuna.Trial):
         'entropy_cost':     trial.suggest_float('entropy_cost', 1e-4, 1e-2, log=True),
         'discounting':      trial.suggest_float('discounting', 0.95, 0.99),
         'unroll_length':    trial.suggest_categorical('unroll_length', [10, 20, 30]),
-      #  'num_minibatches':  trial.suggest_int('num_minibatches', 16, 64, step=16),
+        #'num_minibatches':  trial.suggest_int('num_minibatches', 16, 48, step=16),
       #  'batch_size':       256, # Keep constant to manage VRAM
     }
 
     # --- 3. Environment Setup ---
     # pass weights to the env so stl_reward can use them
-    env = BarkourEnv(reward_weights=reward_weights)
-    eval_env = BarkourEnv(reward_weights=reward_weights)
+    env = BarkourEnv(obs_noise = 0.01, kick_vel = 0.01) # BarkourEnv(reward_weights=reward_weights)
+    eval_env = BarkourEnv(obs_noise = 0.01, kick_vel = 0.01) # BarkourEnv(reward_weights=reward_weights)
     
     eval_idx = 0
 
@@ -90,7 +94,7 @@ def objective(trial: optuna.Trial):
             progress_fn=progress
         )
 
-        # Return a composite metric: Reward + tracking_score
+        # Return a composite metric: Reward + tracking_score + total_dist
         
         if "eval/episode_x_error" not in final_metrics:
             raise RuntimeError(f"Missing x_error; available keys: {list(final_metrics.keys())[:30]}")
@@ -99,12 +103,14 @@ def objective(trial: optuna.Trial):
             tracking_score = float(np.exp(-float(x_vel_error)))
         
         reward_ = float(final_metrics['eval/episode_reward'])
-        score = tracking_score * 100 + reward_
+        total_dist = float(final_metrics['eval/episode_total_dist'])
+        score = tracking_score * total_dist
         
         trial.set_user_attr("avg_reward", reward_)
+        trial.set_user_attr("avg_total_dist", total_dist)
         trial.set_user_attr("avg_tracking_score", tracking_score)
         
-        return score
+        return reward_
     
     except optuna.TrialPruned:
         raise  # Let Optuna handle the pruning
@@ -121,12 +127,12 @@ if __name__ == "__main__":
         sampler=sampler,
         load_if_exists=True,
         pruner = optuna.pruners.MedianPruner(
-                    n_startup_trials=20,   
-                    n_warmup_steps=3,      
+                    n_startup_trials=45,   
+                    n_warmup_steps=5,      
                     interval_steps=1)
     )
 
-    study.optimize(objective, n_trials=100)
+    study.optimize(objective, n_trials=70)
     
     print("Number of finished trials: ", len(study.trials))
     print("Best trial:")
