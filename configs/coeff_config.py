@@ -2,92 +2,171 @@
 # Barkour STL reward config
 # =========================
 
-# Barkour vb joint torque limit and joint acc limit
-tau_max = 18.0 # Nm
-q_dot_max = 25.0 # rad/s
+# Barkour vb joint torque limit and joint velocity limit
+# reward_step only uses tau_max directly. q_dot_max is kept for compatibility.
+tau_max = 18.0  # Nm
+q_dot_max = 25.0  # rad/s
 
-# temporal horizon (50 Hz -> H=10 means 0.2 s)
-H = 28
-H_WARMUP_MIN_VALID = 5  # optional: start strict temporal mins after a few steps
-DT = 0.02
+# -----------------------------------------------------------------------------
+# Temporal settings
+# -----------------------------------------------------------------------------
+DT = 0.02  # 50 Hz control step
+H = 36
+H_MAX = H
+H_by_mode = (30, 24, 24)  # walk, trot, bound
+H_WARMUP_MIN_VALID = 8
 
-# -------------------------
-# gait mode IDs
-# -------------------------
+# -----------------------------------------------------------------------------
+# Gait mode IDs
+# -----------------------------------------------------------------------------
 MODE_WALK = 0
 MODE_TROT = 1
 MODE_BOUND = 2
 
-# -------------------------
-# command-speed hysteresis on |vx| [m/s]
-# user regime: walk [0,0.7], trot [0.7,1.7], bound >1.7
-# use hysteresis to avoid mode chattering around boundaries
-# -------------------------
-WALK_TO_TROT_ENTER = 0.75
-TROT_TO_WALK_EXIT = 0.60
+# -----------------------------------------------------------------------------
+# Command-speed hysteresis on |vx| [m/s]
+# -----------------------------------------------------------------------------
+WALK_TO_TROT_ENTER = 0.72
+TROT_TO_WALK_EXIT = 0.65
+TROT_TO_BOUND_ENTER = 1.75
+BOUND_TO_TROT_EXIT = 1.65
 
-TROT_TO_BOUND_ENTER = 1.80
-BOUND_TO_TROT_EXIT = 1.55
+# Mixed-regime sampling and bound-focused curriculum helpers.
+regime_sample_probs = (0.25, 0.25, 0.50)
+cmd_vx_range = (0.0, 2.1)
+cmd_vy_range = (-0.3, 0.3)
+cmd_yaw_range = (-0.3, 0.3)
+bound_vx_sample_range = (1.65, 2.1)
 
-# robust aggregation
-beta = 10.0
+# Robust aggregation sharpness.
+# `beta` is kept as a compatibility default for external overrides.
+beta = 0.5
+beta_safe = 0.5
+beta_timing = 0.5
+beta_pattern = 0.5
 
-# -------------------------
-# mode-conditioned tracking tolerances
-# (indexed by mode: walk, trot, bound)
-# -------------------------
-eps_vx_by_mode = (0.51, 1.05, 1.05)
-eps_vy_by_mode = (0.1, 0.1, 0.1)
-eps_yaw_by_mode = (0.1, 0.1, 0.1)
+# -----------------------------------------------------------------------------
+# Mode-conditioned tracking tolerances
+# -----------------------------------------------------------------------------
+eps_vx_by_mode = (0.55, 0.60, 0.60)
+eps_vy_by_mode = (0.05, 0.05, 0.05)
+eps_yaw_by_mode = (0.05, 0.05, 0.05)
 
-# -------------------------
-# gait-shape proxy tolerances (contact-pattern based)
-# -------------------------
-# lower is better for these errors; rho = eps - err
-eps_diag_sync = 0.20      # trot diagonal sync error tolerance
-eps_pair_sync = 0.20      # bound front/hind pair sync error tolerance
-eps_bound_overlap = 0.4  # allow some overlap between fore/hind in bound
-eps_walk_no_flight = 0.0  # nlegs-2 >= 0 means no flight (>=2 contacts)
-
-# learned stability parameters
-abs_vz_by_mode = (0.148, 0.179, 0.3)
-com_z_by_mode = (0.225, 0.231, 0.35)  # looser "never fall" floor (more tolerant)
-cop_com_xy_dist_by_mode = (0.156, 0.351, 0.357)
-
-roll_abs_by_mode = (3.10, 3.92, 22.0) # degree
-pitch_abs_by_mode = (3.43, 3.83, 30.0) # degree
-slip_speed_by_mode = (0.6, 1.3, 1.5)
-
+# -----------------------------------------------------------------------------
+# Shared safety thresholds (walk, trot, bound)
+# -----------------------------------------------------------------------------
+min_contacts_by_mode = (2, 2, 0)
 min_contacts = 2
-# Optional: require "3+ contacts occurs at least once every X seconds"
-K_REQUIRE_3PLUS = 11  # walking-trot: “3+ contacts occurs within last 0.22s ≈ 11 steps”
+abs_vz_by_mode = (0.15, 0.18, 0.25)
+com_z_by_mode = (0.18, 0.22, 0.165)
+cop_com_xy_dist_by_mode = (0.10, 0.13, 0.15)
+roll_abs_by_mode = (10.0, 7.0, 20.0)
+pitch_abs_by_mode = (8.0, 7.0, 20.0)
+slip_speed_by_mode = (0.40, 0.75, 0.85)
 
-# gait structure
-stride_period_by_mode = ([0.42, 0.52], [0.32, 0.40], [0.28, 0.40])
-duty_factor_by_mode = ([0.62, 0.69], [0.44, 0.50], [0.25, 0.40],)
-diag_phase_error_by_mode = (0.12, 0.15, )
-diag_2contact_fraction_min_by_mode = (0.95, 0.95, 0.0)
+# -----------------------------------------------------------------------------
+# Mode-dependent gait structure parameters
+# -----------------------------------------------------------------------------
+stride_period_by_mode = ((0.42, 0.54), (0.33, 0.43), (0.25, 0.31))
+duty_factor_by_mode = ((0.62, 0.74), (0.52, 0.60), (0.62, 0.70))
 
-# -------------------------
-# weights
-# -------------------------
-w_vx = 1.77
-w_vy = 0.01
-w_yaw = 0.01
-#w_torque = 0.5
-#w_nlegs = 0.4
-w_tau = 0.04
-w_gait = 0.01
+diag_phase_error_by_mode = (0.10, 0.11, 1.00)
+diag_2contact_fraction_min_by_mode = (0.92, 0.99, 0.00)
+diag_2contact_fraction_max_by_mode = (1.00, 1.00, 0.03)
+contact2_fraction_min_by_mode = (0.00, 0.70, 0.00)
 
-# squash alphas
-alpha_b = 200.0
-alpha_vx = 0.5
-alpha_vy = 1.0
-alpha_yaw = 1.0
-#alpha_torque = 10.0
-#alpha_nlegs = 1.0
-alpha_tau = 300.0     # because tau_dot is torque^2-mean, scale is larger
-alpha_gait = 50.0
+flight_fraction_min_by_mode = (0.00, 0.00, 0.03)
+front_only_fraction_min_by_mode = (0.00, 0.00, 0.17)
+hind_only_fraction_min_by_mode = (0.00, 0.00, 0.12)
+all4_fraction_max_by_mode = (1.00, 0.10, 0.38)
 
-# torque cost (if torque available)
+pair_front_mismatch_max_by_mode = (1.00, 1.00, 0.10)
+pair_hind_mismatch_max_by_mode = (1.00, 1.00, 0.14)
+hind_to_front_lag_by_mode = ((0.00, 1.00), (0.00, 1.00), (0.33, 0.40))
+
+# Compatibility aliases kept for older code paths / logs.
+pair_phase_error_max_by_mode = pair_front_mismatch_max_by_mode
+front_pair_sync_min_by_mode = (0.0, 0.0, 0.86)
+hind_pair_sync_min_by_mode = (0.0, 0.0, 0.82)
+lateral_2contact_fraction_max_by_mode = (0.0, 0.0, 0.12)
+hind_to_front_lag_steps_by_mode = ((0, 0), (0, 0), (3, 6))
+all4_fraction_min_by_mode = (0.0, 0.0, 0.18)
+pair2_fraction_min_by_mode = (0.0, 0.0, 0.88)
+
+# Optional foot-clearance predicate. The current BarkourEnv does not yet feed
+# clearance_history, so reward_step automatically disables this term when absent.
+clearance_min_by_mode = (0.020, 0.025, 0.030)
+
+# Walk mode helper: require occasional >=3-contact support in the recent window.
+K_REQUIRE_3PLUS = 11
+
+# -----------------------------------------------------------------------------
+# Legacy proxy tolerances retained for compatibility with older code paths.
+# -----------------------------------------------------------------------------
+eps_diag_sync = 0.20
+eps_pair_sync = 0.20
+eps_bound_overlap = 0.40
+eps_walk_no_flight = 0.0
+
+# -----------------------------------------------------------------------------
+# Margin scales for normalized robustness
+# -----------------------------------------------------------------------------
+# Safety
+tau_margin_scale = 5.0
+min_contacts_margin_scale = 1.0
+com_z_margin_scale = 0.03
+abs_vz_margin_scale = 0.10
+roll_margin_scale_deg = 5.0
+pitch_margin_scale_deg = 5.0
+slip_margin_scale = 0.20
+support_margin_scale = 0.06
+
+# Tracking: use the mode-dependent eps_* values as the natural normalization.
+track_axis_weights = (1.0, 0.01, 0.01)
+
+# Timing / pattern
+stride_margin_scale_by_mode = (0.05, 0.04, 0.04)
+duty_margin_scale_by_mode = (0.05, 0.03, 0.05)
+diag_phase_margin_scale_by_mode = (0.05, 0.05, 1.00)
+diag2_margin_scale_by_mode = (0.05, 0.03, 0.05)
+contact2_margin_scale_by_mode = (1.00, 1.00, 1.00)
+pair_mismatch_margin_scale_by_mode = (1.00, 1.00, 0.05)
+hindfront_margin_scale_by_mode = (1.00, 1.00, 0.10)
+flight_margin_scale_by_mode = (1.00, 1.00, 0.05)
+front_only_margin_scale_by_mode = (1.00, 1.00, 0.05)
+hind_only_margin_scale_by_mode = (1.00, 1.00, 0.05)
+all4_margin_scale_by_mode = (1.00, 1.00, 0.08)
+event3plus_margin_scale = 1.0
+bound_event_margin_scale = 1.0
+clearance_margin_scale_by_mode = (0.010, 0.010, 0.010)
+
+# Compatibility alias.
+pair_phase_margin_scale_by_mode = pair_mismatch_margin_scale_by_mode
+
+# -----------------------------------------------------------------------------
+# Grouped reward weights and tanh alphas
+# -----------------------------------------------------------------------------
+"""w_safe_by_mode = (1.0, 1.0, 1.2)
+w_track_by_mode = (1.0, 1.0, 1.2)
+w_timing_by_mode = (0.0, 0.0, 1.2)
+w_pattern_by_mode = (1,1, 1.2, 1.4)
+
+alpha_safe_by_mode = (0.9, 0.6, 0.8)
+alpha_track_by_mode = (0.8, 0.7, 0.8)
+alpha_timing_by_mode = (0.0, 0.0, 0.7)
+alpha_pattern_by_mode = (1.2, 0.4, 0.7) """
+
+# Torque effort regularizer coefficient
 gamma_tau = 1e-6
+
+w_safe_by_mode = (1.0, 1.0, 1.0)
+w_track_by_mode = (1.05, 1.03, 0.9)
+w_timing_by_mode = (1.04, 0.84, 0.66)
+w_pattern_by_mode = (1.03, 1.03, 1.0)
+  
+alpha_safe_by_mode = (1.0, 0.8, 1.1)
+alpha_track_by_mode = (0.8, 0.8, 0.7)
+alpha_timing_by_mode = (2.6, 0.9, 0.7)
+alpha_pattern_by_mode = (1.3, 0.5, 0.6)
+
+

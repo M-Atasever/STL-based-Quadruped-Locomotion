@@ -82,7 +82,14 @@ def get_stl_config():
                     # 7-) Contact force limits due to friction cone constraints
                     # 8-) Center of pressure (CoP) remaining in the support polygon constraints 
                     
-                    combined_safety = 1.0,
+                    # Final grouped terms
+                    rho_safety=1.0,
+                    rho_tracking=1.0,
+                    rho_timing=1.0,
+                    rho_pattern=1.0,
+                    total_stl_reward=1.0,
+                    
+                   # combined_safety = 1.0,
                     torque_lim = 1.0,
                    # CoM_stab = 1.0,
                     more_legs_grounded = 1.0,
@@ -110,7 +117,26 @@ def get_stl_config():
                     rho_stride = 1.0, 
                     rho_duty = 1.0, 
                     rho_3plus_event = 1.0, 
-                    rho_support = 1.0
+                    rho_support = 1.0,
+                    rho_diag_phase = 1.0,
+                    rho_p2 = 1.0,
+                    rho_front=1.0,
+                    rho_hind=1.0,
+                    rho_hindfront=1.0,
+                    rho_flight=1.0,
+                    rho_front_only=1.0,
+                    rho_hind_only=1.0,
+                    rho_all4=1.0,
+                    rho_bound_event=1.0,
+                    pitch=0.0,
+                    roll=0.0,
+                    FL=1.0, 
+                    HL=1.0, 
+                    FR=1.0, 
+                    HR=1.0,
+                    #slip=0.0, 
+                   # denom=1.0,
+                   # support_dist=0.0,
       
                     
                 )
