@@ -450,21 +450,14 @@ def reward_step(reward_input, commands, mode, valid_len, weights_override=None):
     rho_front = pair_phase_max - e_front
     rho_hind = pair_phase_max - e_hind
 
-    """ lag_lo = lag_bounds[mode, 0]
-        lag_hi = lag_bounds[mode, 1]
-        rho_hindfront = jnp.minimum(lag_h_to_f - lag_lo, lag_hi - lag_h_to_f) """
-    
-    
-    # Extract leg pairs
-    c_front = c[:, [0, 2]] # FL, FR
-    c_hind  = c[:, [1, 3]] # HL, HR
-
-    # Get timing from your config
-    expected_lag = hind_to_front_lag_by_mode[MODE_BOUND]
-    stride = stride_period_by_mode[MODE_BOUND]
-
-    # Calculate
-    rho_hindfront = 0.0  #compute_phase_offset_robustness(c_front, c_hind, expected_lag, stride, DT)
+    lag_lo = lag_bounds[mode, 0]
+    lag_hi = lag_bounds[mode, 1]
+    rho_hindfront_raw = jnp.minimum(lag_h_to_f - lag_lo, lag_hi - lag_h_to_f)
+    rho_hindfront = jnp.where(
+        (mode == MODE_BOUND) & gait_enabled,
+        rho_hindfront_raw,
+        0.0,
+    )
 
     rho_flight = p_flight - flight_min
     rho_front_only = p_front_only - front_only_min

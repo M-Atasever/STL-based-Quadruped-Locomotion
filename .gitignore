@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+.venv/
+.env
+
+runs/
+colab_handoff/
+mujoco_menagerie/
+docs/reports/
+
+metricssaved.csv
+*.log

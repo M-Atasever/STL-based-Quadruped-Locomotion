@@ -1,5 +1,5 @@
-#%%
 import os
+import sys
 import numpy as np
 from typing import Any, Dict, Sequence, List
 from etils import epath
@@ -16,30 +16,40 @@ from brax.base import Base, Motion, Transform
 from brax.envs.base import Env, PipelineEnv, State
 from brax.io import html, mjcf, model
 
+REPO_ROOT = epath.Path(__file__).resolve().parents[1]
+CONFIG_DIR = REPO_ROOT / 'configs'
+if CONFIG_DIR.as_posix() not in sys.path:
+  sys.path.insert(0, CONFIG_DIR.as_posix())
+
 from reward_config import get_config, get_stl_config
 from stl_reward import reward_step 
+from bound_experiments import get_experiment_config
 from coeff_config import (
     H,
     MODE_WALK, MODE_TROT, MODE_BOUND,
     WALK_TO_TROT_ENTER, TROT_TO_WALK_EXIT,
     TROT_TO_BOUND_ENTER, BOUND_TO_TROT_EXIT,
+    w_pattern_by_mode,
+    alpha_pattern_by_mode,
     cmd_vx_range,
     cmd_vy_range,
     cmd_yaw_range,
 )
 
-os.environ['MUJOCO_GL']='egl'  # Configure MuJoCo to use the EGL rendering backend (requires GPU)
+os.environ.setdefault('MUJOCO_GL', 'egl')  # Local Mac notebooks can set this to glfw before import.
 
-# Tell XLA to use Triton GEMM, this improves steps/sec by ~30% on some GPUs
-xla_flags = os.environ.get('XLA_FLAGS', '')
-xla_flags += ' --xla_gpu_triton_gemm_any=True'
-os.environ['XLA_FLAGS'] = xla_flags
+# Tell XLA to use Triton GEMM on non-macOS GPU runs. This is not a Metal/MPS flag.
+if sys.platform != 'darwin':
+  xla_flags = os.environ.get('XLA_FLAGS', '')
+  if '--xla_gpu_triton_gemm_any=True' not in xla_flags:
+    xla_flags += ' --xla_gpu_triton_gemm_any=True'
+  os.environ['XLA_FLAGS'] = xla_flags
 
 # More legible printing from numpy.
 np.set_printoptions(precision=3, suppress=True, linewidth=100)
 
 
-BARKOUR_ROOT_PATH = epath.Path('mujoco_menagerie/google_barkour_vb')
+BARKOUR_ROOT_PATH = REPO_ROOT / 'mujoco_menagerie/google_barkour_vb'
 STL_REWARD = True
 
 class BarkourEnv(PipelineEnv):
@@ -52,6 +62,8 @@ class BarkourEnv(PipelineEnv):
       kick_vel: float = 0.05,
       scene_file: str = 'scene_mjx.xml',
       reward_weights=None,
+      experiment: str | None = None,
+      experiment_config: Dict[str, Any] | None = None,
       **kwargs,
   ):
     path = BARKOUR_ROOT_PATH / scene_file
@@ -84,54 +96,23 @@ class BarkourEnv(PipelineEnv):
         sys.mj_model, mujoco.mjtObj.mjOBJ_BODY.value, 'torso'
     )
     if reward_weights is None:
-        self.reward_weights = None
+      self.reward_weights = None
     else:
-        """self.reward_weights = jp.array(
-            [reward_weights["w_vx"],
-             reward_weights["w_vy"],
-             reward_weights["w_yaw"],
-          #  reward_weights["w_tau"],
-             reward_weights["w_gait"],
-            
-            reward_weights["alpha_b"],
-            reward_weights["alpha_vx"],
-            reward_weights["alpha_vy"],
-            reward_weights["alpha_yaw"],
-          #  reward_weights["alpha_tau"],
-            reward_weights["alpha_gait"],
-            reward_weights["beta"]
-            ],
-            dtype=jp.float32
-        )"""
-        
-        # New grouped override vector:
-        # [w_track, w_safe, w_timing, w_pattern,
-        #  alpha_track, alpha_safe, alpha_timing, alpha_pattern, beta]
-        if all(k in reward_weights for k in (
-            "w_track", "w_safe", "w_timing", "w_pattern",
-            "alpha_track", "alpha_safe", "alpha_timing", "alpha_pattern",
-            "beta",
-        )):
-            self.reward_weights = jp.array(
-                [
-                    reward_weights["w_track"],
-                    reward_weights["w_safe"],
-                    reward_weights["w_timing"],
-                    reward_weights["w_pattern"],
-                    reward_weights["alpha_track"],
-                    reward_weights["alpha_safe"],
-                    reward_weights["alpha_timing"],
-                    reward_weights["alpha_pattern"],
-                    reward_weights["beta"],
-                ],
-                dtype=jp.float32,
-            )
-        else:
-            raise ValueError(
-                "reward_weights must provide the grouped STL keys: "
-                "w_track, w_safe, w_timing, w_pattern, "
-                "alpha_track, alpha_safe, alpha_timing, alpha_pattern, beta"
-            )
+      required_reward_keys = (
+          "w_track", "w_safe", "w_timing", "w_pattern",
+          "alpha_track", "alpha_safe", "alpha_timing", "alpha_pattern",
+          "beta",
+      )
+      if not all(k in reward_weights for k in required_reward_keys):
+        raise ValueError(
+            "reward_weights must provide the grouped STL keys: "
+            "w_track, w_safe, w_timing, w_pattern, "
+            "alpha_track, alpha_safe, alpha_timing, alpha_pattern, beta"
+        )
+      self.reward_weights = jp.array(
+          [reward_weights[k] for k in required_reward_keys],
+          dtype=jp.float32,
+      )
         
     self._action_scale = action_scale
     self._obs_noise = obs_noise
@@ -166,6 +147,22 @@ class BarkourEnv(PipelineEnv):
     self._lower_leg_body_id = np.array(lower_leg_body_id)
     self._foot_radius = 0.0175
     self._nv = sys.nv
+    self.experiment_config = (
+        experiment_config if experiment_config is not None else get_experiment_config(experiment)
+    )
+    self.experiment_name = (
+        self.experiment_config["name"] if self.experiment_config is not None else "default"
+    )
+    self._sampler_config = (
+        self.experiment_config.get("sampler", {"type": "default"})
+        if self.experiment_config is not None
+        else {"type": "default"}
+    )
+    self._bound_reward_config = (
+        self.experiment_config.get("bound_reward", {})
+        if self.experiment_config is not None
+        else {}
+    )
     
   
   def _update_mode_hysteresis(self, mode: jax.Array, command: jax.Array) -> jax.Array:
@@ -191,7 +188,113 @@ class BarkourEnv(PipelineEnv):
         ),
     )
 
-  def sample_command(self, rng: jax.Array) -> jax.Array:
+  def _bound_soft_transition_values(
+      self,
+      lin_velocity_history: jax.Array,
+      command: jax.Array,
+      valid_len: jax.Array,
+  ) -> Dict[str, jax.Array]:
+    """Soft BOUND reward activation for transition experiments."""
+    cfg = self._bound_reward_config
+    enabled = bool(cfg.get("enable_bound_soft_transition", False))
+    history_len = lin_velocity_history.shape[0]
+    active_len = jp.minimum(jp.asarray(valid_len, dtype=jp.int32), history_len)
+    idx = jp.arange(history_len)
+    mask = idx >= (history_len - active_len)
+    mask_f = mask.astype(jp.float32)
+    denom = jp.maximum(jp.sum(mask_f), 1.0)
+    mean_vx = jp.sum(lin_velocity_history[:, 0] * mask_f) / denom
+
+    if not enabled:
+      one = jp.array(1.0, dtype=jp.float32)
+      return {
+          "bound_soft_command_alpha": one,
+          "bound_soft_speed_gate": one,
+          "bound_effective_pattern_alpha": one,
+          "bound_soft_mean_vx": mean_vx,
+      }
+
+    cmd_lo = float(cfg.get("bound_soft_command_alpha_lo", 1.55))
+    cmd_hi = float(cfg.get("bound_soft_command_alpha_hi", 1.90))
+    command_alpha = jp.clip(
+        (jp.abs(command[0]) - cmd_lo) / jp.maximum(cmd_hi - cmd_lo, 1e-6),
+        0.0,
+        1.0,
+    )
+    speed_center = float(cfg.get("bound_soft_speed_gate_center", 0.90))
+    speed_width = float(cfg.get("bound_soft_speed_gate_width", 0.15))
+    speed_gate = jax.nn.sigmoid((mean_vx - speed_center) / jp.maximum(speed_width, 1e-6))
+    min_valid = int(cfg.get("bound_soft_min_valid_steps", 8))
+    warmup_gate = (valid_len >= min_valid).astype(jp.float32)
+    effective_alpha = command_alpha * speed_gate * warmup_gate
+
+    return {
+        "bound_soft_command_alpha": command_alpha,
+        "bound_soft_speed_gate": speed_gate,
+        "bound_effective_pattern_alpha": effective_alpha,
+        "bound_soft_mean_vx": mean_vx,
+    }
+
+  def _uniform_scalar(self, key: jax.Array, value_range: Sequence[float]) -> jax.Array:
+    return jax.random.uniform(
+        key,
+        shape=(),
+        minval=float(value_range[0]),
+        maxval=float(value_range[1]),
+    )
+
+  def _sample_bound_mixture_command(self, rng: jax.Array) -> jax.Array:
+    cfg = self._sampler_config
+    rng, key_regime, key_vx, key_vy, key_yaw = jax.random.split(rng, 5)
+    probs = jp.array(
+        [
+            float(cfg["nominal_probability"]),
+            float(cfg["transition_probability"]),
+            float(cfg["bound_probability"]),
+        ],
+        dtype=jp.float32,
+    )
+    probs = probs / jp.sum(probs)
+    regime = jax.random.choice(key_regime, 3, shape=(), p=probs)
+
+    vx_nominal = self._uniform_scalar(key_vx, cfg["nominal_vx_range"])
+    vx_transition = self._uniform_scalar(key_vx, cfg["transition_vx_range"])
+    vx_bound = self._uniform_scalar(key_vx, cfg["bound_vx_range"])
+    vx = jp.where(regime == 0, vx_nominal, jp.where(regime == 1, vx_transition, vx_bound))
+
+    vy_nominal = self._uniform_scalar(key_vy, cfg["nominal_vy_range"])
+    vy_bound = self._uniform_scalar(key_vy, cfg["bound_vy_range"])
+    yaw_nominal = self._uniform_scalar(key_yaw, cfg["nominal_yaw_range"])
+    yaw_bound = self._uniform_scalar(key_yaw, cfg["bound_yaw_range"])
+    near_bound = regime != 0
+    vy = jp.where(near_bound, vy_bound, vy_nominal)
+    yaw = jp.where(near_bound, yaw_bound, yaw_nominal)
+    return jp.array([vx, vy, yaw], dtype=jp.float32)
+
+  def _sample_bound_curriculum_command(
+      self, rng: jax.Array, command_resets: jax.Array
+  ) -> jax.Array:
+    cfg = self._sampler_config
+    _, key_vx, key_vy, key_yaw = jax.random.split(rng, 4)
+    reset_count = jp.asarray(command_resets, dtype=jp.int32)
+    stage_a_end = jp.asarray(int(cfg["stage_a_reset_count"]), dtype=jp.int32)
+    stage_b_end = jp.asarray(int(cfg["stage_b_reset_count"]), dtype=jp.int32)
+
+    vx_a = self._uniform_scalar(key_vx, cfg["stage_a_vx_range"])
+    vx_b = self._uniform_scalar(key_vx, cfg["stage_b_vx_range"])
+    vx_c = self._uniform_scalar(key_vx, cfg["stage_c_vx_range"])
+    vx = jp.where(reset_count < stage_a_end, vx_a, jp.where(reset_count < stage_b_end, vx_b, vx_c))
+    vy = self._uniform_scalar(key_vy, cfg["vy_range"])
+    yaw = self._uniform_scalar(key_yaw, cfg["yaw_range"])
+    return jp.array([vx, vy, yaw], dtype=jp.float32)
+
+  def sample_command(self, rng: jax.Array, command_resets: jax.Array | int = 0) -> jax.Array:
+    sampler_type = self._sampler_config.get("type", "default")
+    if sampler_type == "bound_mixture":
+      return self._sample_bound_mixture_command(rng)
+    if sampler_type == "bound_curriculum":
+      return self._sample_bound_curriculum_command(rng, command_resets)
+
     lin_vel_x = [0.0, 1.69]  # min max [m/s]
     lin_vel_y = [-0.2, 0.2]  # min max [m/s]
     ang_vel_yaw = [-0.2, 0.2]  # min max [rad/s]
@@ -208,6 +311,493 @@ class BarkourEnv(PipelineEnv):
     )
     new_cmd = jp.array([lin_vel_x[0], lin_vel_y[0], ang_vel_yaw[0]])
     return new_cmd
+
+  def _bound_contact_pattern_terms(
+      self,
+      contact_history: jax.Array,
+      lin_velocity_history: jax.Array,
+      com_z_history: jax.Array,
+      roll_history: jax.Array,
+      pitch_history: jax.Array,
+      command: jax.Array,
+      valid_len: jax.Array,
+      mode: jax.Array,
+  ) -> Dict[str, jax.Array]:
+    """BOUND-only contact pattern shaping terms from [FL, HL, FR, HR]."""
+    c = contact_history.astype(jp.float32)
+    active_len = jp.minimum(jp.asarray(valid_len, dtype=jp.int32), c.shape[0])
+    idx = jp.arange(c.shape[0])
+    mask = idx >= (c.shape[0] - active_len)
+    mask_f = mask.astype(jp.float32)
+    denom = jp.maximum(jp.sum(mask_f), 1.0)
+
+    c_fl, c_hl, c_fr, c_hr = c[:, 0], c[:, 1], c[:, 2], c[:, 3]
+    front_pair = c_fl * c_fr * (1.0 - c_hl) * (1.0 - c_hr)
+    hind_pair = c_hl * c_hr * (1.0 - c_fl) * (1.0 - c_fr)
+    diagonal_1 = c_fl * c_hr * (1.0 - c_fr) * (1.0 - c_hl)
+    diagonal_2 = c_fr * c_hl * (1.0 - c_fl) * (1.0 - c_hr)
+    all_four = c_fl * c_fr * c_hl * c_hr
+    any_contact = jp.minimum(c_fl + c_hl + c_fr + c_hr, 1.0)
+
+    def masked_mean(x):
+      return jp.sum(x * mask_f) / denom
+
+    front_sync = masked_mean((1.0 - jp.abs(c_fl - c_fr)) * any_contact)
+    hind_sync = masked_mean((1.0 - jp.abs(c_hl - c_hr)) * any_contact)
+    pair_support = masked_mean(front_pair + hind_pair)
+    diagonal_penalty = masked_mean(diagonal_1 + diagonal_2)
+    all_four_penalty = masked_mean(all_four)
+    contact_pattern_reward = pair_support - diagonal_penalty - 0.5 * all_four_penalty
+
+    is_bound = (mode == MODE_BOUND).astype(jp.float32)
+    contact_weight = float(self._bound_reward_config.get("bound_contact_pattern_weight", 0.0))
+    diagonal_weight = float(self._bound_reward_config.get("bound_diagonal_penalty_weight", 0.0))
+    all_four_weight = float(self._bound_reward_config.get("bound_all_four_penalty_weight", 0.0))
+    pair_sync_weight = float(self._bound_reward_config.get("bound_pair_sync_weight", 0.0))
+    raw_bonus = is_bound * (
+        contact_weight * pair_support
+        - diagonal_weight * diagonal_penalty
+        - all_four_weight * all_four_penalty
+        + pair_sync_weight * 0.5 * (front_sync + hind_sync) * pair_support
+    )
+    gate_enabled = bool(self._bound_reward_config.get("enable_tracking_gate", False))
+    mean_vx = masked_mean(lin_velocity_history[:, 0])
+    if gate_enabled:
+      vx_error = jp.abs(mean_vx - command[0])
+      vx_full = float(self._bound_reward_config.get("gate_vx_error_full", 0.55))
+      vx_zero = float(self._bound_reward_config.get("gate_vx_error_zero", 1.10))
+      vx_gate = jp.clip((vx_zero - vx_error) / jp.maximum(vx_zero - vx_full, 1e-6), 0.0, 1.0)
+
+      min_height = jp.min(jp.where(mask, com_z_history, jp.inf))
+      height_full = float(self._bound_reward_config.get("gate_base_height_full", 0.22))
+      height_zero = float(self._bound_reward_config.get("gate_base_height_zero", 0.18))
+      height_gate = jp.clip(
+          (min_height - height_zero) / jp.maximum(height_full - height_zero, 1e-6),
+          0.0,
+          1.0,
+      )
+
+      max_roll_pitch = jp.maximum(
+          jp.max(jp.where(mask, jp.abs(roll_history), 0.0)),
+          jp.max(jp.where(mask, jp.abs(pitch_history), 0.0)),
+      )
+      angle_full = float(self._bound_reward_config.get("gate_roll_pitch_full_rad", 0.30))
+      angle_zero = float(self._bound_reward_config.get("gate_roll_pitch_zero_rad", 0.45))
+      angle_gate = jp.clip(
+          (angle_zero - max_roll_pitch) / jp.maximum(angle_zero - angle_full, 1e-6),
+          0.0,
+          1.0,
+      )
+      min_valid = int(self._bound_reward_config.get("gate_min_valid_steps", 8))
+      warmup_gate = (valid_len >= min_valid).astype(jp.float32)
+      stability_gate = height_gate * angle_gate
+      contact_gate = warmup_gate * vx_gate * stability_gate
+    else:
+      vx_gate = jp.array(1.0, dtype=jp.float32)
+      stability_gate = jp.array(1.0, dtype=jp.float32)
+      contact_gate = jp.array(1.0, dtype=jp.float32)
+
+    soft_terms = self._bound_soft_transition_values(
+        lin_velocity_history=lin_velocity_history,
+        command=command,
+        valid_len=valid_len,
+    )
+    soft_alpha = soft_terms["bound_effective_pattern_alpha"]
+    bonus = raw_bonus * contact_gate * soft_alpha
+
+    return {
+        "bound_front_pair_sync": is_bound * front_sync,
+        "bound_hind_pair_sync": is_bound * hind_sync,
+        "bound_front_or_hind_pair_support": is_bound * pair_support,
+        "bound_diagonal_trot_penalty": is_bound * diagonal_penalty,
+        "bound_all_four_stance_penalty": is_bound * all_four_penalty,
+        "bound_contact_pattern_reward": is_bound * contact_pattern_reward,
+        "bound_contact_pattern_bonus": bonus,
+        "bound_raw_contact_pattern_bonus": raw_bonus,
+        "bound_contact_gate": is_bound * contact_gate,
+        "bound_vx_tracking_gate": is_bound * vx_gate,
+        "bound_stability_gate": is_bound * stability_gate,
+        "bound_soft_command_alpha": is_bound * soft_terms["bound_soft_command_alpha"],
+        "bound_soft_speed_gate": is_bound * soft_terms["bound_soft_speed_gate"],
+        "bound_effective_pattern_alpha": is_bound * soft_alpha,
+        "bound_soft_mean_vx": is_bound * soft_terms["bound_soft_mean_vx"],
+    }
+
+  def _bound_transition_guard_terms(
+      self,
+      contact_history: jax.Array,
+      lin_velocity_history: jax.Array,
+      com_z_history: jax.Array,
+      roll_history: jax.Array,
+      pitch_history: jax.Array,
+      command: jax.Array,
+      valid_len: jax.Array,
+      mode: jax.Array,
+      rho_pattern: jax.Array,
+  ) -> Dict[str, jax.Array]:
+    """Opt-in guard against rewarding BOUND pattern while not moving/stable."""
+    cfg = self._bound_reward_config
+    enabled = bool(cfg.get("enable_bound_transition_guard", False))
+    if not enabled:
+      zero = jp.array(0.0, dtype=jp.float32)
+      return {
+          "bound_transition_guard_adjustment": zero,
+          "bound_pattern_gate": zero,
+          "bound_pattern_gate_penalty": zero,
+          "bound_positive_pattern_contribution": zero,
+          "bound_tracking_guard_penalty": zero,
+          "transition_tracking_guard_penalty": zero,
+          "bound_transition_vx_tracking_gate": zero,
+          "bound_transition_stability_gate": zero,
+          "bound_forward_progress_target": zero,
+          "bound_forward_progress_mean_vx": zero,
+          "bound_forward_progress_margin": zero,
+          "bound_forward_progress_penalty": zero,
+          "bound_all_four_stall_penalty": zero,
+          "bound_all_four_stall_fraction": zero,
+          "bound_soft_progress_reward": zero,
+          "bound_soft_progress_score": zero,
+          "bound_soft_anti_stall_penalty": zero,
+          "bound_soft_anti_stall_margin": zero,
+          "bound_all_four_after_warmup_penalty": zero,
+          "bound_pair_support_after_warmup_reward": zero,
+          "bound_pair_support_shortfall_penalty": zero,
+          "bound_pair_support_after_warmup_fraction": zero,
+          "bound_diagonal_after_warmup_penalty": zero,
+          "bound_diagonal_after_warmup_fraction": zero,
+          "bound_pair_balance_after_warmup_penalty": zero,
+          "bound_pair_balance_after_warmup_score": zero,
+          "bound_balanced_pair_after_warmup_reward": zero,
+          "bound_balanced_pair_after_warmup_fraction": zero,
+          "bound_hind_pair_shortfall_penalty": zero,
+          "bound_front_pair_dominance_penalty": zero,
+          "bound_front_pair_dominance_margin": zero,
+          "bound_pair_balance_gate": zero,
+          "bound_pair_gated_progress_reward": zero,
+          "bound_pair_gated_speed_target_reward": zero,
+          "bound_pair_gated_speed_shortfall_penalty": zero,
+          "bound_pair_gated_speed_target": zero,
+          "bound_pair_gated_speed_margin": zero,
+      }
+
+    history_len = lin_velocity_history.shape[0]
+    active_len = jp.minimum(jp.asarray(valid_len, dtype=jp.int32), history_len)
+    idx = jp.arange(history_len)
+    mask = idx >= (history_len - active_len)
+    mask_f = mask.astype(jp.float32)
+    denom = jp.maximum(jp.sum(mask_f), 1.0)
+
+    def masked_mean(x):
+      return jp.sum(x * mask_f) / denom
+
+    mean_vx = masked_mean(lin_velocity_history[:, 0])
+    vx_error = jp.abs(mean_vx - command[0])
+    vx_full = float(cfg.get("gate_vx_error_full", 0.45))
+    vx_zero = float(cfg.get("gate_vx_error_zero", 0.95))
+    vx_gate = jp.clip((vx_zero - vx_error) / jp.maximum(vx_zero - vx_full, 1e-6), 0.0, 1.0)
+
+    min_height = jp.min(jp.where(mask, com_z_history, jp.inf))
+    height_full = float(cfg.get("gate_base_height_full", 0.23))
+    height_zero = float(cfg.get("gate_base_height_zero", 0.18))
+    height_gate = jp.clip(
+        (min_height - height_zero) / jp.maximum(height_full - height_zero, 1e-6),
+        0.0,
+        1.0,
+    )
+
+    max_roll_pitch = jp.maximum(
+        jp.max(jp.where(mask, jp.abs(roll_history), 0.0)),
+        jp.max(jp.where(mask, jp.abs(pitch_history), 0.0)),
+    )
+    angle_full = float(cfg.get("gate_roll_pitch_full_rad", 0.28))
+    angle_zero = float(cfg.get("gate_roll_pitch_zero_rad", 0.45))
+    angle_gate = jp.clip(
+        (angle_zero - max_roll_pitch) / jp.maximum(angle_zero - angle_full, 1e-6),
+        0.0,
+        1.0,
+    )
+    min_valid = int(cfg.get("gate_min_valid_steps", 8))
+    warmup_gate = (valid_len >= min_valid).astype(jp.float32)
+    stability_gate = height_gate * angle_gate
+    gate = warmup_gate * vx_gate * stability_gate
+
+    abs_vx_cmd = jp.abs(command[0])
+    is_bound = (mode == MODE_BOUND).astype(jp.float32)
+    transition_min = float(cfg.get("transition_guard_min_vx", 1.45))
+    transition_max = float(cfg.get("transition_guard_max_vx", TROT_TO_BOUND_ENTER))
+    is_transition = (
+        (abs_vx_cmd >= transition_min)
+        & (abs_vx_cmd < transition_max)
+        & (mode != MODE_BOUND)
+    ).astype(jp.float32)
+
+    pattern_alpha = float(cfg.get("bound_pattern_guard_alpha", 0.6))
+    positive_pattern = jp.maximum(jp.tanh(rho_pattern / jp.maximum(pattern_alpha, 1e-6)), 0.0)
+    pattern_guard_weight = float(cfg.get("bound_pattern_guard_weight", 1.0))
+    pattern_penalty = -is_bound * pattern_guard_weight * (1.0 - gate) * positive_pattern
+
+    bound_tracking_weight = float(cfg.get("bound_tracking_guard_penalty_weight", 0.0))
+    transition_tracking_weight = float(cfg.get("transition_tracking_guard_penalty_weight", 0.0))
+    bound_tracking_penalty = -is_bound * bound_tracking_weight * (1.0 - vx_gate)
+    transition_tracking_penalty = -is_transition * transition_tracking_weight * (1.0 - vx_gate)
+
+    forward_guard_enabled = bool(cfg.get("enable_bound_forward_progress_guard", False))
+    c = contact_history.astype(jp.float32)
+    c_fl, c_hl, c_fr, c_hr = c[:, 0], c[:, 1], c[:, 2], c[:, 3]
+    front_pair = c_fl * c_fr * (1.0 - c_hl) * (1.0 - c_hr)
+    hind_pair = c_hl * c_hr * (1.0 - c_fl) * (1.0 - c_fr)
+    diagonal_1 = c_fl * c_hr * (1.0 - c_fr) * (1.0 - c_hl)
+    diagonal_2 = c_fr * c_hl * (1.0 - c_fl) * (1.0 - c_hr)
+    all_four = c_fl * c_hl * c_fr * c_hr
+    front_pair_fraction = masked_mean(front_pair)
+    hind_pair_fraction = masked_mean(hind_pair)
+    pair_support_fraction = front_pair_fraction + hind_pair_fraction
+    diagonal_observed_fraction = masked_mean(diagonal_1 + diagonal_2)
+    all_four_observed_fraction = masked_mean(all_four)
+    if forward_guard_enabled:
+      min_fraction = float(cfg.get("bound_forward_progress_min_fraction", 0.45))
+      min_vx = float(cfg.get("bound_forward_progress_min_vx", 0.70))
+      target_vx = jp.maximum(min_vx, min_fraction * jp.abs(command[0]))
+      forward_margin = mean_vx - target_vx
+      forward_shortfall = jp.clip((target_vx - mean_vx) / jp.maximum(target_vx, 1e-6), 0.0, 1.0)
+      progress_weight = float(cfg.get("bound_forward_progress_penalty_weight", 0.0))
+      forward_progress_penalty = -is_bound * progress_weight * forward_shortfall
+
+      all_four_fraction = all_four_observed_fraction
+      all_four_weight = float(cfg.get("bound_all_four_stall_penalty_weight", 0.0))
+      all_four_stall_penalty = -is_bound * all_four_weight * forward_shortfall * all_four_fraction
+    else:
+      target_vx = jp.array(0.0, dtype=jp.float32)
+      forward_margin = jp.array(0.0, dtype=jp.float32)
+      forward_progress_penalty = jp.array(0.0, dtype=jp.float32)
+      all_four_fraction = all_four_observed_fraction
+      all_four_stall_penalty = jp.array(0.0, dtype=jp.float32)
+
+    soft_progress_enabled = bool(cfg.get("enable_bound_soft_progress_reward", False))
+    if soft_progress_enabled:
+      progress_scale = float(cfg.get("bound_soft_progress_scale_vx", 0.60))
+      soft_progress_score = jp.tanh(jp.maximum(mean_vx, 0.0) / jp.maximum(progress_scale, 1e-6))
+      soft_progress_weight = float(cfg.get("bound_soft_progress_reward_weight", 0.0))
+      soft_progress_reward = is_bound * warmup_gate * soft_progress_weight * soft_progress_score
+
+      anti_stall_min_vx = float(cfg.get("bound_soft_anti_stall_min_vx", 0.30))
+      anti_stall_margin = mean_vx - anti_stall_min_vx
+      anti_stall_shortfall = jp.clip(
+          (anti_stall_min_vx - mean_vx) / jp.maximum(anti_stall_min_vx, 1e-6),
+          0.0,
+          1.0,
+      )
+      anti_stall_weight = float(cfg.get("bound_soft_anti_stall_penalty_weight", 0.0))
+      soft_anti_stall_penalty = -is_bound * warmup_gate * anti_stall_weight * anti_stall_shortfall
+
+      all_four_allowed = float(cfg.get("bound_all_four_after_warmup_allowed_fraction", 0.55))
+      all_four_excess = jp.clip(
+          (all_four_observed_fraction - all_four_allowed)
+          / jp.maximum(1.0 - all_four_allowed, 1e-6),
+          0.0,
+          1.0,
+      )
+      all_four_after_weight = float(cfg.get("bound_all_four_after_warmup_penalty_weight", 0.0))
+      all_four_after_warmup_penalty = -is_bound * warmup_gate * all_four_after_weight * all_four_excess
+    else:
+      soft_progress_score = jp.array(0.0, dtype=jp.float32)
+      soft_progress_reward = jp.array(0.0, dtype=jp.float32)
+      anti_stall_margin = jp.array(0.0, dtype=jp.float32)
+      soft_anti_stall_penalty = jp.array(0.0, dtype=jp.float32)
+      all_four_after_warmup_penalty = jp.array(0.0, dtype=jp.float32)
+
+    clean_pair_enabled = bool(cfg.get("enable_bound_clean_pair_reward", False))
+    if clean_pair_enabled:
+      pair_reward_weight = float(cfg.get("bound_pair_support_after_warmup_reward_weight", 0.0))
+      pair_support_after_warmup_reward = (
+          is_bound * warmup_gate * pair_reward_weight * pair_support_fraction
+      )
+
+      min_pair_support = float(cfg.get("bound_min_pair_support_after_warmup", 0.20))
+      pair_shortfall = jp.clip(
+          (min_pair_support - pair_support_fraction) / jp.maximum(min_pair_support, 1e-6),
+          0.0,
+          1.0,
+      )
+      pair_shortfall_weight = float(cfg.get("bound_pair_support_shortfall_penalty_weight", 0.0))
+      pair_support_shortfall_penalty = (
+          -is_bound * warmup_gate * pair_shortfall_weight * pair_shortfall
+      )
+
+      diagonal_allowed = float(cfg.get("bound_diagonal_after_warmup_allowed_fraction", 0.15))
+      diagonal_excess = jp.clip(
+          (diagonal_observed_fraction - diagonal_allowed)
+          / jp.maximum(1.0 - diagonal_allowed, 1e-6),
+          0.0,
+          1.0,
+      )
+      diagonal_after_weight = float(cfg.get("bound_diagonal_after_warmup_penalty_weight", 0.0))
+      diagonal_after_warmup_penalty = (
+          -is_bound * warmup_gate * diagonal_after_weight * diagonal_excess
+      )
+
+      pair_balance_score_raw = 1.0 - jp.clip(
+          jp.abs(front_pair_fraction - hind_pair_fraction)
+          / jp.maximum(pair_support_fraction, 1e-6),
+          0.0,
+          1.0,
+      )
+      pair_balance_score = jp.where(pair_support_fraction > 1e-6, pair_balance_score_raw, 0.0)
+      min_balance = float(cfg.get("bound_pair_balance_min_score", 0.35))
+      balance_shortfall = jp.clip(
+          (min_balance - pair_balance_score) / jp.maximum(min_balance, 1e-6),
+          0.0,
+          1.0,
+      )
+      balance_weight = float(cfg.get("bound_pair_balance_after_warmup_penalty_weight", 0.0))
+      balance_active = (pair_support_fraction >= min_pair_support).astype(jp.float32)
+      pair_balance_after_warmup_penalty = (
+          -is_bound * warmup_gate * balance_active * balance_weight * balance_shortfall
+      )
+
+      balanced_pair_fraction = jp.minimum(front_pair_fraction, hind_pair_fraction)
+      balanced_pair_weight = float(cfg.get("bound_balanced_pair_reward_weight", 0.0))
+      balanced_pair_after_warmup_reward = (
+          is_bound * warmup_gate * balanced_pair_weight * balanced_pair_fraction
+      )
+
+      min_hind_pair = float(cfg.get("bound_min_hind_pair_after_warmup", 0.0))
+      hind_pair_shortfall = jp.clip(
+          (min_hind_pair - hind_pair_fraction) / jp.maximum(min_hind_pair, 1e-6),
+          0.0,
+          1.0,
+      )
+      hind_shortfall_weight = float(cfg.get("bound_hind_pair_shortfall_penalty_weight", 0.0))
+      hind_pair_shortfall_penalty = (
+          -is_bound * warmup_gate * hind_shortfall_weight * hind_pair_shortfall
+      )
+
+      dominance_allowed_gap = float(cfg.get("bound_front_pair_dominance_allowed_gap", 0.20))
+      front_pair_dominance_margin = front_pair_fraction - hind_pair_fraction - dominance_allowed_gap
+      front_pair_dominance_excess = jp.clip(
+          front_pair_dominance_margin / jp.maximum(1.0 - dominance_allowed_gap, 1e-6),
+          0.0,
+          1.0,
+      )
+      dominance_weight = float(cfg.get("bound_front_pair_dominance_penalty_weight", 0.0))
+      front_pair_dominance_penalty = (
+          -is_bound * warmup_gate * dominance_weight * front_pair_dominance_excess
+      )
+
+      balanced_gate_target = float(cfg.get("bound_balanced_pair_gate_target", 0.08))
+      pair_balance_gate = jp.clip(
+          balanced_pair_fraction / jp.maximum(balanced_gate_target, 1e-6),
+          0.0,
+          1.0,
+      )
+      gated_progress_weight = float(cfg.get("bound_pair_gated_progress_reward_weight", 0.0))
+      pair_gated_progress_reward = (
+          is_bound * warmup_gate * gated_progress_weight * soft_progress_score * pair_balance_gate
+      )
+
+      gated_speed_target = float(cfg.get("bound_pair_gated_speed_target_vx", 0.0))
+      gated_speed_sigma = float(cfg.get("bound_pair_gated_speed_target_sigma", 0.18))
+      gated_speed_margin = mean_vx - gated_speed_target
+      gated_speed_score = jp.exp(
+          -jp.square(gated_speed_margin) / jp.maximum(2.0 * gated_speed_sigma * gated_speed_sigma, 1e-6)
+      )
+      gated_speed_reward_weight = float(cfg.get("bound_pair_gated_speed_target_reward_weight", 0.0))
+      pair_gated_speed_target_reward = (
+          is_bound * warmup_gate * gated_speed_reward_weight * pair_balance_gate * gated_speed_score
+      )
+      gated_speed_shortfall = jp.clip(
+          (gated_speed_target - mean_vx) / jp.maximum(gated_speed_target, 1e-6),
+          0.0,
+          1.0,
+      )
+      gated_speed_shortfall_weight = float(
+          cfg.get("bound_pair_gated_speed_shortfall_penalty_weight", 0.0)
+      )
+      pair_gated_speed_shortfall_penalty = (
+          -is_bound
+          * warmup_gate
+          * gated_speed_shortfall_weight
+          * pair_balance_gate
+          * gated_speed_shortfall
+      )
+    else:
+      pair_support_after_warmup_reward = jp.array(0.0, dtype=jp.float32)
+      pair_support_shortfall_penalty = jp.array(0.0, dtype=jp.float32)
+      diagonal_after_warmup_penalty = jp.array(0.0, dtype=jp.float32)
+      pair_balance_after_warmup_penalty = jp.array(0.0, dtype=jp.float32)
+      pair_balance_score = jp.array(0.0, dtype=jp.float32)
+      balanced_pair_after_warmup_reward = jp.array(0.0, dtype=jp.float32)
+      balanced_pair_fraction = jp.array(0.0, dtype=jp.float32)
+      hind_pair_shortfall_penalty = jp.array(0.0, dtype=jp.float32)
+      front_pair_dominance_penalty = jp.array(0.0, dtype=jp.float32)
+      front_pair_dominance_margin = jp.array(0.0, dtype=jp.float32)
+      pair_balance_gate = jp.array(0.0, dtype=jp.float32)
+      pair_gated_progress_reward = jp.array(0.0, dtype=jp.float32)
+      pair_gated_speed_target_reward = jp.array(0.0, dtype=jp.float32)
+      pair_gated_speed_shortfall_penalty = jp.array(0.0, dtype=jp.float32)
+      gated_speed_target = jp.array(0.0, dtype=jp.float32)
+      gated_speed_margin = jp.array(0.0, dtype=jp.float32)
+
+    adjustment = (
+        pattern_penalty
+        + bound_tracking_penalty
+        + transition_tracking_penalty
+        + forward_progress_penalty
+        + all_four_stall_penalty
+        + soft_progress_reward
+        + soft_anti_stall_penalty
+        + all_four_after_warmup_penalty
+        + pair_support_after_warmup_reward
+        + pair_support_shortfall_penalty
+        + diagonal_after_warmup_penalty
+        + pair_balance_after_warmup_penalty
+        + balanced_pair_after_warmup_reward
+        + hind_pair_shortfall_penalty
+        + front_pair_dominance_penalty
+        + pair_gated_progress_reward
+        + pair_gated_speed_target_reward
+        + pair_gated_speed_shortfall_penalty
+    )
+
+    return {
+        "bound_transition_guard_adjustment": adjustment,
+        "bound_pattern_gate": is_bound * gate,
+        "bound_pattern_gate_penalty": pattern_penalty,
+        "bound_positive_pattern_contribution": is_bound * positive_pattern,
+        "bound_tracking_guard_penalty": bound_tracking_penalty,
+        "transition_tracking_guard_penalty": transition_tracking_penalty,
+        "bound_transition_vx_tracking_gate": (is_bound + is_transition) * vx_gate,
+        "bound_transition_stability_gate": (is_bound + is_transition) * stability_gate,
+        "bound_forward_progress_target": is_bound * target_vx,
+        "bound_forward_progress_mean_vx": is_bound * mean_vx,
+        "bound_forward_progress_margin": is_bound * forward_margin,
+        "bound_forward_progress_penalty": forward_progress_penalty,
+        "bound_all_four_stall_penalty": all_four_stall_penalty,
+        "bound_all_four_stall_fraction": is_bound * all_four_fraction,
+        "bound_soft_progress_reward": soft_progress_reward,
+        "bound_soft_progress_score": is_bound * soft_progress_score,
+        "bound_soft_anti_stall_penalty": soft_anti_stall_penalty,
+        "bound_soft_anti_stall_margin": is_bound * anti_stall_margin,
+        "bound_all_four_after_warmup_penalty": all_four_after_warmup_penalty,
+        "bound_pair_support_after_warmup_reward": pair_support_after_warmup_reward,
+        "bound_pair_support_shortfall_penalty": pair_support_shortfall_penalty,
+        "bound_pair_support_after_warmup_fraction": is_bound * pair_support_fraction,
+        "bound_diagonal_after_warmup_penalty": diagonal_after_warmup_penalty,
+        "bound_diagonal_after_warmup_fraction": is_bound * diagonal_observed_fraction,
+        "bound_pair_balance_after_warmup_penalty": pair_balance_after_warmup_penalty,
+        "bound_pair_balance_after_warmup_score": is_bound * pair_balance_score,
+        "bound_balanced_pair_after_warmup_reward": balanced_pair_after_warmup_reward,
+        "bound_balanced_pair_after_warmup_fraction": is_bound * balanced_pair_fraction,
+        "bound_hind_pair_shortfall_penalty": hind_pair_shortfall_penalty,
+        "bound_front_pair_dominance_penalty": front_pair_dominance_penalty,
+        "bound_front_pair_dominance_margin": is_bound * front_pair_dominance_margin,
+        "bound_pair_balance_gate": is_bound * pair_balance_gate,
+        "bound_pair_gated_progress_reward": pair_gated_progress_reward,
+        "bound_pair_gated_speed_target_reward": pair_gated_speed_target_reward,
+        "bound_pair_gated_speed_shortfall_penalty": pair_gated_speed_shortfall_penalty,
+        "bound_pair_gated_speed_target": is_bound * gated_speed_target,
+        "bound_pair_gated_speed_margin": is_bound * gated_speed_margin,
+    }
 
   """def sample_command(self, rng: jax.Array) -> jax.Array:
 
@@ -255,7 +845,7 @@ class BarkourEnv(PipelineEnv):
     )
 
     return jp.array([vx, vy, yaw], dtype=jp.float32) """
-	
+      
 
   def reset(self, rng: jax.Array) -> State:  # pytype: disable=signature-mismatch
     rng, key = jax.random.split(rng)
@@ -274,6 +864,7 @@ class BarkourEnv(PipelineEnv):
         'rewards': {k: 0.0 for k in self.reward_config.rewards.scales.keys()},
         'kick': jp.array([0.0, 0.0]),
         'step': 0,
+        'command_resets': jp.array(0, dtype=jp.int32),
         
         'history_len': jp.array(0, dtype=jp.int32),
         'mode': mode0,
@@ -420,14 +1011,63 @@ class BarkourEnv(PipelineEnv):
         #slip, 
         #denom,
         #support_dist,
-        ) = reward_step(
+      ) = reward_step(
           reward_input=reward_input,
           commands=state.info['command'],
           mode=mode,
           valid_len=history_len,
           weights_override=self.reward_weights,)
+      bound_soft_terms = self._bound_soft_transition_values(
+          lin_velocity_history=lin_velocity_history,
+          command=state.info['command'],
+          valid_len=history_len,
+      )
+      if self.reward_weights is None:
+        pattern_weight = jp.asarray(w_pattern_by_mode)[mode]
+        pattern_alpha = jp.asarray(alpha_pattern_by_mode)[mode]
+      else:
+        pattern_weight = self.reward_weights[3]
+        pattern_alpha = self.reward_weights[7]
+      is_bound_mode = (mode == MODE_BOUND).astype(jp.float32)
+      pattern_component = pattern_weight * jp.tanh(rho_pattern / jp.maximum(pattern_alpha, 1e-6))
+      strict_pattern_adjustment = (
+          is_bound_mode
+          * (bound_soft_terms["bound_effective_pattern_alpha"] - 1.0)
+          * pattern_component
+      )
+      bound_contact_terms = self._bound_contact_pattern_terms(
+          contact_history=contact_history,
+          lin_velocity_history=lin_velocity_history,
+          com_z_history=com_z_history,
+          roll_history=roll_history,
+          pitch_history=pitch_history,
+          command=state.info['command'],
+          valid_len=history_len,
+          mode=mode,
+      )
+      bound_guard_terms = self._bound_transition_guard_terms(
+          contact_history=contact_history,
+          lin_velocity_history=lin_velocity_history,
+          com_z_history=com_z_history,
+          roll_history=roll_history,
+          pitch_history=pitch_history,
+          command=state.info['command'],
+          valid_len=history_len,
+          mode=mode,
+          rho_pattern=rho_pattern,
+      )
+      r = (
+          r
+          + strict_pattern_adjustment
+          + bound_contact_terms["bound_contact_pattern_bonus"]
+          + bound_guard_terms["bound_transition_guard_adjustment"]
+      )
+      termination_penalty_weight = float(
+          self._bound_reward_config.get("stl_termination_penalty", 0.0)
+      )
+      stl_termination_penalty = -termination_penalty_weight * done.astype(jp.float32)
+      r = r + stl_termination_penalty / self.dt
 
-    
       rewards = {
           'total_stl_reward': r,
           'rho_comz': rho_comz,
@@ -470,10 +1110,24 @@ class BarkourEnv(PipelineEnv):
           "HL": HL, 
           "FR": FR, 
           "HR": HR,
+          "bound_strict_pattern_adjustment": strict_pattern_adjustment,
+          "stl_termination_penalty": stl_termination_penalty,
          # "slip": slip, 
          # "denom": denom,
          # "support_dist": support_dist,
-          }
+      }
+      rewards.update(bound_contact_terms)
+      rewards.update(bound_guard_terms)
+      rewards.update({
+          "bound_strict_pattern_adjustment": strict_pattern_adjustment,
+          "bound_soft_command_alpha": is_bound_mode * bound_soft_terms["bound_soft_command_alpha"],
+          "bound_soft_speed_gate": is_bound_mode * bound_soft_terms["bound_soft_speed_gate"],
+          "bound_effective_pattern_alpha": is_bound_mode * bound_soft_terms["bound_effective_pattern_alpha"],
+          "bound_soft_mean_vx": is_bound_mode * bound_soft_terms["bound_soft_mean_vx"],
+      })
+      rewards = {
+          k: rewards.get(k, 0.0) for k in self.reward_config.rewards.scales.keys()
+      }
       
       
       reward = jp.clip(r * self.dt, -100.0, 1000.0)
@@ -537,7 +1191,8 @@ class BarkourEnv(PipelineEnv):
 
     # On either timeout or termination, start a fresh command and clear all
     # command-conditioned histories so the next [t-H, t] window is consistent.
-    sampled_command = self.sample_command(cmd_rng)
+    next_command_resets = state.info['command_resets'] + command_reset.astype(jp.int32)
+    sampled_command = self.sample_command(cmd_rng, next_command_resets)
     next_command = jp.where(command_reset, sampled_command, state.info['command'])
     next_mode = jp.where(
         command_reset,
@@ -547,6 +1202,7 @@ class BarkourEnv(PipelineEnv):
 
     state.info['command'] = next_command
     state.info['step'] = jp.where(command_reset, 0, state.info['step'])
+    state.info['command_resets'] = next_command_resets
   
     
     # This makes the [t-H, t] reward window consistent with the current command.
