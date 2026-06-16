@@ -26,6 +26,8 @@ from coeff_config import (
     cmd_vx_range,
     cmd_vy_range,
     cmd_yaw_range,
+    bound_vx_sample_range,
+    regime_sample_probs,
 )
 
 os.environ['MUJOCO_GL']='egl'  # Configure MuJoCo to use the EGL rendering backend (requires GPU)
@@ -52,6 +54,10 @@ class BarkourEnv(PipelineEnv):
       kick_vel: float = 0.05,
       scene_file: str = 'scene_mjx.xml',
       reward_weights=None,
+      command_sampling: str = 'mixed',
+      bound_straight_commands: bool = True,
+      #contact_z_on: float = 0.003,
+      #contact_z_off: float = 0.010,
       **kwargs,
   ):
     path = BARKOUR_ROOT_PATH / scene_file
@@ -86,27 +92,6 @@ class BarkourEnv(PipelineEnv):
     if reward_weights is None:
         self.reward_weights = None
     else:
-        """self.reward_weights = jp.array(
-            [reward_weights["w_vx"],
-             reward_weights["w_vy"],
-             reward_weights["w_yaw"],
-          #  reward_weights["w_tau"],
-             reward_weights["w_gait"],
-            
-            reward_weights["alpha_b"],
-            reward_weights["alpha_vx"],
-            reward_weights["alpha_vy"],
-            reward_weights["alpha_yaw"],
-          #  reward_weights["alpha_tau"],
-            reward_weights["alpha_gait"],
-            reward_weights["beta"]
-            ],
-            dtype=jp.float32
-        )"""
-        
-        # New grouped override vector:
-        # [w_track, w_safe, w_timing, w_pattern,
-        #  alpha_track, alpha_safe, alpha_timing, alpha_pattern, beta]
         if all(k in reward_weights for k in (
             "w_track", "w_safe", "w_timing", "w_pattern",
             "alpha_track", "alpha_safe", "alpha_timing", "alpha_pattern",
@@ -166,6 +151,11 @@ class BarkourEnv(PipelineEnv):
     self._lower_leg_body_id = np.array(lower_leg_body_id)
     self._foot_radius = 0.0175
     self._nv = sys.nv
+    self._command_sampling = command_sampling
+    self._bound_straight_commands = bound_straight_commands
+    #self._contact_z_on = contact_z_on
+    #self._contact_z_off = contact_z_off
+
     
   
   def _update_mode_hysteresis(self, mode: jax.Array, command: jax.Array) -> jax.Array:
@@ -192,44 +182,43 @@ class BarkourEnv(PipelineEnv):
     )
 
   def sample_command(self, rng: jax.Array) -> jax.Array:
-    lin_vel_x = [0.0, 1.69]  # min max [m/s]
-    lin_vel_y = [-0.2, 0.2]  # min max [m/s]
-    ang_vel_yaw = [-0.2, 0.2]  # min max [rad/s]
-
-    _, key1, key2, key3 = jax.random.split(rng, 4)
-    lin_vel_x = jax.random.uniform(
-        key1, (1,), minval=lin_vel_x[0], maxval=lin_vel_x[1]
-    )
-    lin_vel_y = jax.random.uniform(
-        key2, (1,), minval=lin_vel_y[0], maxval=lin_vel_y[1]
-    )
-    ang_vel_yaw = jax.random.uniform(
-        key3, (1,), minval=ang_vel_yaw[0], maxval=ang_vel_yaw[1]
-    )
-    new_cmd = jp.array([lin_vel_x[0], lin_vel_y[0], ang_vel_yaw[0]])
-    return new_cmd
-
-  """def sample_command(self, rng: jax.Array) -> jax.Array:
-
     rng, key_regime, key_vx, key_vy, key_yaw = jax.random.split(rng, 5)
-    sampled_regime = jax.random.randint(key_regime, shape=(), minval=0, maxval=3)
-    
-    probs = jp.array([0.3, 0.3, 0.4], dtype=jp.float32)
-    sampled_regime = jax.random.choice(key_regime, 3, shape=(), p=probs)
+
+    probs = jp.array(regime_sample_probs, dtype=jp.float32)
+    probs = probs / jp.sum(probs)
+
+    if self._command_sampling == 'bound_only':
+      sampled_regime = jp.array(MODE_BOUND, dtype=jp.int32)
+    elif self._command_sampling == 'walk_trot_only':
+      walk_trot_probs = probs[:2] / jp.sum(probs[:2])
+      sampled_regime = jax.random.choice(
+          key_regime,
+          jp.array([MODE_WALK, MODE_TROT], dtype=jp.int32),
+          shape=(),
+          p=walk_trot_probs,
+      )
+    else:
+      sampled_regime = jax.random.choice(
+          key_regime,
+          jp.array([MODE_WALK, MODE_TROT, MODE_BOUND], dtype=jp.int32),
+          shape=(),
+          p=probs,
+      )
 
     vx_min_global, vx_max_global = cmd_vx_range
 
     walk_lo = vx_min_global
-    walk_hi = jp.maximum(vx_min_global, TROT_TO_WALK_EXIT)
+    walk_hi = jp.maximum(vx_min_global + 1e-6, TROT_TO_WALK_EXIT)
 
-    trot_lo = WALK_TO_TROT_ENTER 
-    trot_hi = jp.maximum(trot_lo, BOUND_TO_TROT_EXIT)
+    trot_lo = WALK_TO_TROT_ENTER
+    trot_hi = jp.maximum(trot_lo + 1e-6, BOUND_TO_TROT_EXIT)
 
-    bound_lo = TROT_TO_BOUND_ENTER 
-    bound_hi = jp.maximum(bound_lo, vx_max_global)
+    bound_lo, bound_hi = bound_vx_sample_range
+    bound_hi = jp.minimum(bound_hi, vx_max_global)
+    bound_hi = jp.maximum(bound_lo + 1e-6, bound_hi)
 
     def _sample_uniform(key, lo, hi):
-        return jax.random.uniform(key, shape=(), minval=lo, maxval=hi)
+      return jax.random.uniform(key, shape=(), minval=lo, maxval=hi)
 
     vx_walk = _sample_uniform(key_vx, walk_lo, walk_hi)
     vx_trot = _sample_uniform(key_vx, trot_lo, trot_hi)
@@ -241,23 +230,28 @@ class BarkourEnv(PipelineEnv):
         jp.where(sampled_regime == MODE_TROT, vx_trot, vx_bound),
     )
 
-    # easier command distribution for gait learning
+    sampled_vy = jax.random.uniform(
+        key_vy, shape=(), minval=cmd_vy_range[0], maxval=cmd_vy_range[1]
+    )
+    sampled_yaw = jax.random.uniform(
+        key_yaw, shape=(), minval=cmd_yaw_range[0], maxval=cmd_yaw_range[1]
+    )
+
     vy = jp.where(
-        sampled_regime == MODE_BOUND,
+        (sampled_regime == MODE_BOUND) & self._bound_straight_commands,
         0.0,
-        jax.random.uniform(key_vy, shape=(), minval=-0.2, maxval=0.2),
+        sampled_vy,
     )
-
     yaw = jp.where(
-        sampled_regime == MODE_BOUND,
+        (sampled_regime == MODE_BOUND) & self._bound_straight_commands,
         0.0,
-        jax.random.uniform(key_yaw, shape=(), minval=-0.2, maxval=0.2),
+        sampled_yaw,
     )
 
-    return jp.array([vx, vy, yaw], dtype=jp.float32) """
+    return jp.array([vx, vy, yaw], dtype=jp.float32)
 	
 
-  def reset(self, rng: jax.Array) -> State:  # pytype: disable=signature-mismatch
+  def reset(self, rng: jax.Array) -> State:  
     rng, key = jax.random.split(rng)
 
     pipeline_state = self.pipeline_init(self._init_q, jp.zeros(self._nv))
@@ -293,14 +287,13 @@ class BarkourEnv(PipelineEnv):
     obs_history = jp.zeros(15 * 34) # jp.zeros(15 * 32)  # store 15 steps of history
     obs = self._get_obs(pipeline_state, state_info, obs_history)
     reward, done = jp.zeros(2)
-    # self.reward_input = None
     metrics = {'total_dist': 0.0}
     for k in state_info['rewards']:
       metrics[k] = state_info['rewards'][k]
-    state = State(pipeline_state, obs, reward, done, metrics, state_info)  # pytype: disable=wrong-arg-types
+    state = State(pipeline_state, obs, reward, done, metrics, state_info) 
     return state
 
-  def step(self, state: State, action: jax.Array) -> State:  # pytype: disable=signature-mismatch
+  def step(self, state: State, action: jax.Array) -> State:  
     rng, cmd_rng, kick_noise_2 = jax.random.split(state.info['rng'], 3)
 
     # kick
@@ -308,7 +301,7 @@ class BarkourEnv(PipelineEnv):
     kick_theta = jax.random.uniform(kick_noise_2, maxval=2 * jp.pi)
     kick = jp.array([jp.cos(kick_theta), jp.sin(kick_theta)])
     kick *= jp.mod(state.info['step'], push_interval) == 0
-    qvel = state.pipeline_state.qvel  # pytype: disable=attribute-error
+    qvel = state.pipeline_state.qvel  
     qvel = qvel.at[:2].set(kick * self._kick_vel + qvel[:2])
     state = state.tree_replace({'pipeline_state.qvel': qvel})
 
@@ -323,26 +316,16 @@ class BarkourEnv(PipelineEnv):
     joint_angles = pipeline_state.q[7:]
     joint_vel = pipeline_state.qd[6:]
 
-    # foot contact data based on z-position
-    foot_pos = pipeline_state.site_xpos[self._feet_site_id]  # pytype: disable=attribute-error
+    # foot contact data based on z-position with Schmitt-trigger hysteresis - disabled
+    foot_pos = pipeline_state.site_xpos[self._feet_site_id]  
     foot_contact_z = foot_pos[:, 2] - self._foot_radius
+    #contact_on = foot_contact_z < self._contact_z_on
+    #contact_off = foot_contact_z > self._contact_z_off
     contact = foot_contact_z < 1e-3  # a mm or less off the floor
     contact_filt_mm = contact | state.info['last_contact']
     contact_filt_cm = (foot_contact_z < 3e-2) | state.info['last_contact']
     first_contact = (state.info['feet_air_time'] > 0) * contact_filt_mm
     state.info['feet_air_time'] += self.dt
-    
-    
-    """# Barkour.py (inside step, replace the single-threshold contact)
-    z_on  = 0.003   # 3 mm: turn contact ON
-    z_off = 0.010   # 10 mm: turn contact OFF
-
-    contact_on  = foot_contact_z < z_on
-    contact_off = foot_contact_z > z_off
-
-    contact = jp.where(contact_on, True,
-            jp.where(contact_off, False, state.info['last_contact']))"""
-
 
 
     # done if joint limits are reached or robot is falling
@@ -350,7 +333,11 @@ class BarkourEnv(PipelineEnv):
     done = jp.dot(math.rotate(up, x.rot[self._torso_idx - 1]), up) < 0
     done |= jp.any(joint_angles < self.lowers)
     done |= jp.any(joint_angles > self.uppers)
-    done |= pipeline_state.x.pos[self._torso_idx - 1, 2] < 0.18
+    #done |= pipeline_state.x.pos[self._torso_idx - 1, 2] < 0.15 # 0.18
+    
+    mode = self._update_mode_hysteresis(state.info['mode'], state.info['command'])
+    torso_z_min = jp.where(mode == MODE_BOUND, 0.15, 0.18)
+    done |= pipeline_state.x.pos[self._torso_idx - 1, 2] < torso_z_min
     
     # update history buffers
     local_vel = math.rotate(xd.vel[0], math.quat_inv(x.rot[0]))
@@ -358,8 +345,7 @@ class BarkourEnv(PipelineEnv):
     
     inv_torso_rot = math.quat_inv(x.rot[0])
     g_body = math.rotate(jp.array([0.0, 0.0, -1.0]), inv_torso_rot)
-    # roll = jp.atan2(g_body[1], g_body[2]) # Old code (returns 3.14 when robot upright perfectly)
-    roll = jp.atan2(g_body[1], -g_body[2]) # New code (returns 0.0 when robot upright perfectly)
+    roll = jp.atan2(g_body[1], -g_body[2]) # (returns 0.0 when robot upright perfectly)
     pitch = jp.atan2(-g_body[0], jp.sqrt(g_body[1] * g_body[1] + g_body[2] * g_body[2])) 
     
     # slip proxy from finite-diff feet xy (using previous feet_history[-1])
@@ -389,7 +375,6 @@ class BarkourEnv(PipelineEnv):
     # calculate reward
     
     if STL_REWARD:
-      #print("torque shape:", pipeline_state.qfrc_actuator.shape)  = (18,)  /  the latter 6 dimensions comes from the base
       
       reward_input = { 'tau_history': tau_history, 
                         'CoM_history': CoM_history,
@@ -416,10 +401,10 @@ class BarkourEnv(PipelineEnv):
         rho_hindfront,
         rho_flight,
         rho_front_only,
-        rho_hind_only,pitch,roll, FL, HL, FR, HR,
-        #slip, 
-        #denom,
-        #support_dist,
+        rho_hind_only,
+        rho_all4,
+        rho_bound_event,
+        pitch,roll, FL, HL, FR, HR,
         ) = reward_step(
           reward_input=reward_input,
           commands=state.info['command'],
@@ -464,6 +449,8 @@ class BarkourEnv(PipelineEnv):
           "rho_flight": rho_flight,
           "rho_front_only": rho_front_only,
           "rho_hind_only": rho_hind_only,
+          "rho_all4": rho_all4,
+          "rho_bound_event": rho_bound_event,
           "pitch": pitch,
           "roll": roll,
           "FL": FL, 
@@ -489,7 +476,7 @@ class BarkourEnv(PipelineEnv):
           'lin_vel_z': self._reward_lin_vel_z(xd),
           'ang_vel_xy': self._reward_ang_vel_xy(xd),
           'orientation': self._reward_orientation(x),
-          'torques': self._reward_torques(pipeline_state.qfrc_actuator),  # pytype: disable=attribute-error
+          'torques': self._reward_torques(pipeline_state.qfrc_actuator),  
           'action_rate': self._reward_action_rate(action, state.info['last_act']),
           'stand_still': self._reward_stand_still(
               state.info['command'], joint_angles,

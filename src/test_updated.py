@@ -56,7 +56,7 @@ os.environ['XLA_FLAGS'] = xla_flags
 np.set_printoptions(precision=3, suppress=True, linewidth=120)
 
 GRAVITY = 9.81
-DEFAULT_COMMANDS = [0.3, 0.5, 0.7, 1.0, 1.3, 1.6, 1.9]
+DEFAULT_COMMANDS = [0.3, 0.5, 0.7, 1.0, 1.3, 1.6, 1.9, 2.0, 2.1]
 
 
 def _install_running_stats_compat_patch():

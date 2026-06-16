@@ -31,9 +31,8 @@ np.set_printoptions(precision=3, suppress=True, linewidth=100)
 local_model = True
 brax_renderer = False
 
-#model_path = '/home/matasever/projects/Quadrupeds_STLReward/models3/2026_04_09'
 #ckpt_path = '/home/matasever/projects/Quadrupeds_STLReward/models_to_generate_datasets/original_bound_model/400000000'
-ckpt_path = '/home/matasever/projects/Quadrupeds_STLReward/bound2/ckpts/2026_04_23/467927040' 
+ckpt_path = '/home/matasever/projects/Quadrupeds_STLReward/models10/ckpts/2026_05_28/311377920' 
 
 def _install_running_stats_compat_patch():
     try:
@@ -134,7 +133,7 @@ eval_env = BarkourEnv()
 jit_step = jax.jit(eval_env.step)
 
 # Commands only used for BarkourEnv evaluation.
-x_vel = 1.9
+x_vel = 1.2
 y_vel = 0.0
 ang_vel = 0.0
 the_command = jp.array([x_vel, y_vel, ang_vel], dtype=jp.float32)
