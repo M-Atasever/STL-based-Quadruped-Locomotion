@@ -11,7 +11,7 @@ q_dot_max = 25.0  # rad/s
 # Temporal settings
 # -----------------------------------------------------------------------------
 DT = 0.02  # 50 Hz control step
-H = 36
+H = 30
 H_MAX = H
 H_by_mode = (30, 24, 24)  # walk, trot, bound
 H_WARMUP_MIN_VALID = 8
@@ -28,18 +28,17 @@ MODE_BOUND = 2
 # -----------------------------------------------------------------------------
 WALK_TO_TROT_ENTER = 0.72
 TROT_TO_WALK_EXIT = 0.65
-TROT_TO_BOUND_ENTER = 1.75
-BOUND_TO_TROT_EXIT = 1.65
+TROT_TO_BOUND_ENTER = 1.55
+BOUND_TO_TROT_EXIT = 1.45
 
 # Mixed-regime sampling and bound-focused curriculum helpers.
-regime_sample_probs = (0.25, 0.25, 0.50)
-cmd_vx_range = (0.0, 2.1)
-cmd_vy_range = (-0.3, 0.3)
-cmd_yaw_range = (-0.3, 0.3)
-bound_vx_sample_range = (1.65, 2.1)
+regime_sample_probs = (0.25, 0.35, 0.40)
+cmd_vx_range = (0.0, 1.9)
+cmd_vy_range = (-0.2, 0.2)
+cmd_yaw_range = (-0.2, 0.2)
+bound_vx_sample_range = (1.45, 1.9)
 
 # Robust aggregation sharpness.
-# `beta` is kept as a compatibility default for external overrides.
 beta = 0.5
 beta_safe = 0.5
 beta_timing = 0.5
@@ -58,10 +57,10 @@ eps_yaw_by_mode = (0.05, 0.05, 0.05)
 min_contacts_by_mode = (2, 2, 0)
 min_contacts = 2
 abs_vz_by_mode = (0.15, 0.18, 0.25)
-com_z_by_mode = (0.18, 0.22, 0.165)
+com_z_by_mode = (0.18, 0.22, 0.16)
 cop_com_xy_dist_by_mode = (0.10, 0.13, 0.15)
-roll_abs_by_mode = (10.0, 7.0, 20.0)
-pitch_abs_by_mode = (8.0, 7.0, 20.0)
+roll_abs_by_mode = (10.0, 7.0, 15.0)
+pitch_abs_by_mode = (8.0, 7.0, 15.0)
 slip_speed_by_mode = (0.40, 0.75, 0.85)
 
 # -----------------------------------------------------------------------------
@@ -75,10 +74,14 @@ diag_2contact_fraction_min_by_mode = (0.92, 0.99, 0.00)
 diag_2contact_fraction_max_by_mode = (1.00, 1.00, 0.03)
 contact2_fraction_min_by_mode = (0.00, 0.70, 0.00)
 
-flight_fraction_min_by_mode = (0.00, 0.00, 0.03)
-front_only_fraction_min_by_mode = (0.00, 0.00, 0.17)
-hind_only_fraction_min_by_mode = (0.00, 0.00, 0.12)
-all4_fraction_max_by_mode = (1.00, 0.10, 0.38)
+flight_fraction_min_by_mode = (0.00, 0.00, 0.04)
+front_only_fraction_min_by_mode = (0.00, 0.00, 0.18)
+hind_only_fraction_min_by_mode = (0.00, 0.00, 0.16)
+front_only_fraction_max_by_mode = (1.00, 1.00, 0.42)
+hind_only_fraction_max_by_mode = (1.00, 1.00, 0.38)
+
+all4_fraction_max_by_mode = (1.00, 0.10, 0.30)
+all4_fraction_min_by_mode = (0.00, 0.50, 0.10)
 
 pair_front_mismatch_max_by_mode = (1.00, 1.00, 0.10)
 pair_hind_mismatch_max_by_mode = (1.00, 1.00, 0.14)
@@ -146,27 +149,18 @@ pair_phase_margin_scale_by_mode = pair_mismatch_margin_scale_by_mode
 # -----------------------------------------------------------------------------
 # Grouped reward weights and tanh alphas
 # -----------------------------------------------------------------------------
-"""w_safe_by_mode = (1.0, 1.0, 1.2)
-w_track_by_mode = (1.0, 1.0, 1.2)
-w_timing_by_mode = (0.0, 0.0, 1.2)
-w_pattern_by_mode = (1,1, 1.2, 1.4)
+w_safe_by_mode = (1.0, 1.0, 1.0)
+w_track_by_mode = (1.0, 1.0, 1.15)
+#w_timing_by_mode = (0.0, 0.0, 1.2)
+w_pattern_by_mode = (1.1, 1.2, 1.3)
 
 alpha_safe_by_mode = (0.9, 0.6, 0.8)
 alpha_track_by_mode = (0.8, 0.7, 0.8)
-alpha_timing_by_mode = (0.0, 0.0, 0.7)
-alpha_pattern_by_mode = (1.2, 0.4, 0.7) """
+#alpha_timing_by_mode = (0.0, 0.0, 0.7)
+alpha_pattern_by_mode = (1.2, 0.4, 0.7)
 
 # Torque effort regularizer coefficient
-gamma_tau = 1e-6
+gamma_tau = 1e-6  # 1e-5
 
-w_safe_by_mode = (1.0, 1.0, 1.0)
-w_track_by_mode = (1.05, 1.03, 0.9)
-w_timing_by_mode = (1.04, 0.84, 0.66)
-w_pattern_by_mode = (1.03, 1.03, 1.0)
-  
-alpha_safe_by_mode = (1.0, 0.8, 1.1)
-alpha_track_by_mode = (0.8, 0.8, 0.7)
-alpha_timing_by_mode = (2.6, 0.9, 0.7)
-alpha_pattern_by_mode = (1.3, 0.5, 0.6)
 
 
