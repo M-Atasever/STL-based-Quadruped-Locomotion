@@ -14,8 +14,6 @@ Short rollout clips are included in [`assets/videos/`](assets/videos/). Click a 
 | Trot | [<img src="assets/videos/trot.png" alt="Trot rollout" width="140">](assets/videos/trot.mp4) | `vx = 1.2 m/s` | [`trot.mp4`](assets/videos/trot.mp4) |
 | Bound | [<img src="assets/videos/bound.png" alt="Bound rollout" width="140">](assets/videos/bound.mp4) | `vx = 1.9 m/s` | [`bound.mp4`](assets/videos/bound.mp4) |
 
-For large videos, prefer a GitHub Release, project page, or external archive link, then add thumbnail previews in this README.
-
 ## What This Code Does
 
 - Defines an MJX/Brax `BarkourEnv` environment around the MuJoCo Menagerie Barkour model.
@@ -140,16 +138,3 @@ This repository includes [`CITATION.cff`](CITATION.cff), so GitHub will show a *
 Merve Atasever. STL-based Quadruped Locomotion. GitHub repository:
 https://github.com/M-Atasever/STL-based-Quadruped-Locomotion
 ```
-
-If this repository becomes associated with a paper, thesis, DOI, or archived release, update [`CITATION.cff`](CITATION.cff) with the formal citation metadata.
-
-## Notes for Reproducibility
-
-- Checkpoints and trained models are not committed to the repository.
-- Several scripts currently include absolute paths from the original training machine; update those paths before running elsewhere.
-- The MuJoCo Menagerie Barkour assets are an external dependency and are not vendored here.
-- Large videos and checkpoints should be stored in GitHub Releases, an external artifact store, or Git LFS rather than committed directly.
-
-## License
-
-No license file is currently included. Add a `LICENSE` file before publishing this repository for reuse by others.
