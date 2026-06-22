@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and package caches
+.venv/
+.venv-*/
+.uv-cache/
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# Experiment outputs
+checkpoints/
+models/
+models*/
+ckpts/
+rollout_results/
+testing_reward_components.csv
+testing_reward_plots/
+eval_rollouts.csv
+eval_summary.csv
+eval_summary.json
+metricssaved.csv
+
+# Large local assets
+*.ckpt
+*.pkl
+*.npz
+*.npy
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/

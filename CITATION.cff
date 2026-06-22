@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "STL-based Quadruped Locomotion"
+type: software
+authors:
+  - family-names: "Atasever"
+    given-names: "Merve"
+repository-code: "https://github.com/M-Atasever/STL-based-Quadruped-Locomotion"
+abstract: "A reinforcement-learning framework for agile quadruped locomotion using Signal Temporal Logic robustness rewards in MuJoCo MJX/Brax."
+keywords:
+  - quadruped locomotion
+  - signal temporal logic
+  - reinforcement learning
+  - MuJoCo
+  - MJX
+  - Brax
+  - Barkour
