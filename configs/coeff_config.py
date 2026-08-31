@@ -26,17 +26,18 @@ MODE_BOUND = 2
 # -----------------------------------------------------------------------------
 # Command-speed hysteresis on |vx| [m/s]
 # -----------------------------------------------------------------------------
+
 WALK_TO_TROT_ENTER = 0.72
 TROT_TO_WALK_EXIT = 0.65
-TROT_TO_BOUND_ENTER = 1.55
-BOUND_TO_TROT_EXIT = 1.45
+TROT_TO_BOUND_ENTER = 1.75
+BOUND_TO_TROT_EXIT = 1.70
 
 # Mixed-regime sampling and bound-focused curriculum helpers.
-regime_sample_probs = (0.25, 0.35, 0.40)
+regime_sample_probs = (0.2, 0.3, 0.50)
 cmd_vx_range = (0.0, 1.9)
 cmd_vy_range = (-0.2, 0.2)
 cmd_yaw_range = (-0.2, 0.2)
-bound_vx_sample_range = (1.45, 1.9)
+bound_vx_sample_range = (1.75, 1.9)
 
 # Robust aggregation sharpness.
 beta = 0.5
